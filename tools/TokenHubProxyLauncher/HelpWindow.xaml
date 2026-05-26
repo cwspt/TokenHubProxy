@@ -1,0 +1,69 @@
+<Window x:Class="TokenHubProxyLauncher.HelpWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Help"
+        Height="720"
+        Width="860"
+        MinHeight="620"
+        MinWidth="760"
+        Icon="Assets/TokenHubProxyLauncher.ico"
+        Background="#F6F7F9"
+        WindowStartupLocation="CenterOwner">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Grid.Row="0" Margin="0,0,0,12">
+            <TextBlock x:Name="TitleTextBlock" FontSize="22" FontWeight="SemiBold" />
+            <TextBlock x:Name="SubtitleTextBlock" Foreground="#526071" Margin="0,4,0,0" TextWrapping="Wrap" />
+        </StackPanel>
+
+        <Border Grid.Row="1" Background="#FFFFFF" BorderBrush="#D8DEE8" BorderThickness="1" CornerRadius="6">
+            <ScrollViewer VerticalScrollBarVisibility="Auto" Padding="18">
+                <StackPanel>
+                    <TextBlock x:Name="FirstTimeHeadingTextBlock" FontSize="17" FontWeight="SemiBold" Margin="0,0,0,8" />
+                    <TextBlock x:Name="FirstTimeTextBlock" TextWrapping="Wrap" Margin="0,0,0,12" />
+
+                    <TextBlock x:Name="ConfigHeadingTextBlock" FontSize="17" FontWeight="SemiBold" Margin="0,8,0,8" />
+                    <TextBlock x:Name="ConfigIntroTextBlock" TextWrapping="Wrap" Margin="0,0,0,8" />
+                    <TextBox x:Name="ConfigTextBox"
+                             IsReadOnly="True"
+                             TextWrapping="NoWrap"
+                             HorizontalScrollBarVisibility="Auto"
+                             VerticalScrollBarVisibility="Auto"
+                             FontFamily="Consolas"
+                             FontSize="12"
+                             MinHeight="178" />
+
+                    <TextBlock x:Name="DailyHeadingTextBlock" FontSize="17" FontWeight="SemiBold" Margin="0,16,0,8" />
+                    <TextBlock x:Name="DailyTextBlock" TextWrapping="Wrap" Margin="0,0,0,12" />
+
+                    <TextBlock x:Name="CodexHomeHeadingTextBlock" FontSize="17" FontWeight="SemiBold" Margin="0,8,0,8" />
+                    <TextBlock x:Name="CodexHomeTextBlock" TextWrapping="Wrap" Margin="0,0,0,12" />
+
+                    <TextBlock x:Name="PresetHeadingTextBlock" FontSize="17" FontWeight="SemiBold" Margin="0,8,0,8" />
+                    <TextBlock x:Name="PresetTextBlock" TextWrapping="Wrap" Margin="0,0,0,12" />
+
+                    <TextBlock x:Name="BaseUrlShortcutHeadingTextBlock" FontSize="17" FontWeight="SemiBold" Margin="0,8,0,8" />
+                    <TextBlock x:Name="BaseUrlShortcutTextBlock" TextWrapping="Wrap" Margin="0,0,0,12" />
+
+                    <TextBlock x:Name="LogsHeadingTextBlock" FontSize="17" FontWeight="SemiBold" Margin="0,8,0,8" />
+                    <TextBlock x:Name="LogsTextBlock" TextWrapping="Wrap" Margin="0,0,0,12" />
+
+                    <TextBlock x:Name="TroubleshootingHeadingTextBlock" FontSize="17" FontWeight="SemiBold" Margin="0,8,0,8" />
+                    <TextBlock x:Name="TroubleshootingTextBlock" TextWrapping="Wrap" Margin="0,0,0,12" />
+
+                    <TextBlock x:Name="SecurityHeadingTextBlock" FontSize="17" FontWeight="SemiBold" Margin="0,8,0,8" />
+                    <TextBlock x:Name="SecurityTextBlock" TextWrapping="Wrap" />
+                </StackPanel>
+            </ScrollViewer>
+        </Border>
+
+        <StackPanel Grid.Row="2" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
+            <Button x:Name="CloseButton" Width="96" Height="32" IsDefault="True" Click="CloseButton_Click" />
+        </StackPanel>
+    </Grid>
+</Window>

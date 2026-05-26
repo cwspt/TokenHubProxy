@@ -1,0 +1,2 @@
+D:\Projects\Git\AITools\TokenHubResponsesProxy\dist\TokenHubResponsesProxyLauncher\TokenHubProxyLauncher.pdb
+D:\Projects\Git\AITools\TokenHubResponsesProxy\dist\TokenHubResponsesProxyLauncher\TokenHubProxyLauncher.exe

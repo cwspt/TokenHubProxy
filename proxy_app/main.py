@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -29,10 +30,15 @@ class Settings:
     proxy_key: str
     request_timeout_seconds: float
     enable_tool_calls: bool
+    upstream_tool_choice_mode: str
+    response_language_instruction: str
     response_ttl_seconds: int
 
     @classmethod
     def from_env(cls) -> "Settings":
+        tool_choice_mode = os.getenv("UPSTREAM_TOOL_CHOICE_MODE", "passthrough").strip().lower()
+        if tool_choice_mode not in {"passthrough", "omit_forced"}:
+            tool_choice_mode = "passthrough"
         return cls(
             tokenhub_api_key=os.getenv("TOKENHUB_API_KEY", ""),
             tokenhub_base_url=os.getenv(
@@ -44,6 +50,8 @@ class Settings:
             request_timeout_seconds=float(os.getenv("PROXY_REQUEST_TIMEOUT_SECONDS", "600")),
             enable_tool_calls=os.getenv("ENABLE_TOOL_CALLS", "false").lower()
             in {"1", "true", "yes", "on"},
+            upstream_tool_choice_mode=tool_choice_mode,
+            response_language_instruction=os.getenv("RESPONSE_LANGUAGE_INSTRUCTION", "").strip(),
             response_ttl_seconds=int(os.getenv("RESPONSE_STORE_TTL_SECONDS", "3600")),
         )
 
@@ -71,6 +79,7 @@ class ProxyMetrics:
 
 SETTINGS = Settings.from_env()
 RESPONSES: dict[str, StoredResponse] = {}
+TOOL_CALL_REASONING: dict[str, tuple[float, str]] = {}
 METRICS = ProxyMetrics(started_at=int(time.time()))
 app = FastAPI(title="TokenHub Responses Proxy", version="0.1.0")
 IGNORED_RESPONSES_TOOL_TYPES = {
@@ -82,7 +91,9 @@ IGNORED_RESPONSES_TOOL_TYPES = {
     "image_generation",
     "local_shell",
     "mcp",
+    "namespace",
 }
+MAX_UPSTREAM_ERROR_DETAIL_CHARS = 500
 
 
 def now_unix() -> int:
@@ -98,6 +109,31 @@ def prune_response_store() -> None:
     expired = [key for key, value in RESPONSES.items() if value.expires_at <= now]
     for key in expired:
         RESPONSES.pop(key, None)
+    expired_tool_calls = [key for key, value in TOOL_CALL_REASONING.items() if value[0] <= now]
+    for key in expired_tool_calls:
+        TOOL_CALL_REASONING.pop(key, None)
+
+
+def remember_tool_call_reasoning(output: list[dict[str, Any]], reasoning_content: str) -> None:
+    if not reasoning_content:
+        return
+    expires_at = time.time() + SETTINGS.response_ttl_seconds
+    for item in output:
+        if item.get("type") not in {"function_call", "custom_tool_call"}:
+            continue
+        call_id = item.get("call_id")
+        if call_id:
+            TOOL_CALL_REASONING[str(call_id)] = (expires_at, reasoning_content)
+
+
+def reasoning_content_for_call_id(call_id: Any) -> str:
+    if not call_id:
+        return ""
+    prune_response_store()
+    stored = TOOL_CALL_REASONING.get(str(call_id))
+    if not stored:
+        return ""
+    return stored[1]
 
 
 def require_proxy_auth(authorization: str | None) -> None:
@@ -274,6 +310,35 @@ def custom_tool_input_from_arguments(arguments: Any) -> str:
     return text_from_content(parsed)
 
 
+def chat_tool_names(chat_tools: Any) -> set[str]:
+    names: set[str] = set()
+    if not isinstance(chat_tools, list):
+        return names
+    for tool in chat_tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("name"):
+            names.add(str(function["name"]))
+    return names
+
+
+def tool_name_aliases_for_chat_tools(chat_tools: Any) -> dict[str, str]:
+    names = chat_tool_names(chat_tools)
+    aliases: dict[str, str] = {}
+    if "shell_command" in names and "shell" not in names:
+        aliases["shell"] = "shell_command"
+    return aliases
+
+
+def resolve_tool_call_name(name: Any, aliases: dict[str, str]) -> Any:
+    if isinstance(name, str) and name in aliases:
+        replacement = aliases[name]
+        LOG.info("aliased_tool_call_name from=%s to=%s", name, replacement)
+        return replacement
+    return name
+
+
 def input_item_to_messages(item: dict[str, Any]) -> list[dict[str, Any]]:
     item_type = item.get("type")
     if item_type == "message" or ("role" in item and "content" in item):
@@ -314,22 +379,26 @@ def input_item_to_messages(item: dict[str, Any]) -> list[dict[str, Any]]:
         ]
 
     if item_type == "function_call":
-        return [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [response_function_call_to_chat_tool_call(item)],
-            }
-        ]
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [response_function_call_to_chat_tool_call(item)],
+        }
+        reasoning_content = reasoning_content_for_call_id(item.get("call_id") or item.get("id"))
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
+        return [message]
 
     if item_type == "custom_tool_call":
-        return [
-            {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [response_custom_tool_call_to_chat_tool_call(item)],
-            }
-        ]
+        message = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [response_custom_tool_call_to_chat_tool_call(item)],
+        }
+        reasoning_content = reasoning_content_for_call_id(item.get("call_id") or item.get("id"))
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
+        return [message]
 
     if item_type in {"reasoning", "summary"}:
         return []
@@ -339,6 +408,9 @@ def input_item_to_messages(item: dict[str, Any]) -> list[dict[str, Any]]:
 
 def responses_input_to_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
+    if SETTINGS.response_language_instruction:
+        messages.append({"role": "system", "content": SETTINGS.response_language_instruction})
+
     instructions = payload.get("instructions")
     if instructions:
         messages.append({"role": "system", "content": str(instructions)})
@@ -382,10 +454,15 @@ def responses_tools_to_chat_tools(tools: Any) -> tuple[list[dict[str, Any]] | No
 
     chat_tools: list[dict[str, Any]] = []
     custom_tool_names: set[str] = set()
+    tool_summaries: list[str] = []
     for tool in tools:
         if not isinstance(tool, dict):
             raise HTTPException(status_code=400, detail="Responses tool entries must be objects")
         tool_type = tool.get("type")
+        tool_name = tool.get("name")
+        if tool_type == "function" and not tool_name and isinstance(tool.get("function"), dict):
+            tool_name = tool["function"].get("name")
+        tool_summaries.append(f"{tool_type}:{tool_name or '-'}")
         if tool_type == "function":
             function_def = {
                 "name": tool.get("name"),
@@ -429,16 +506,24 @@ def responses_tools_to_chat_tools(tools: Any) -> tuple[list[dict[str, Any]] | No
             continue
 
         if tool_type in IGNORED_RESPONSES_TOOL_TYPES:
-            LOG.info("ignored_responses_tool_type tool_type=%s", tool_type)
+            LOG.info("ignored_responses_tool_type tool_type=%s tool_name=%s", tool_type, tool_name or "-")
             continue
 
         else:
             raise HTTPException(status_code=400, detail=f"Unsupported Responses tool type: {tool.get('type')}")
 
+    if tool_summaries:
+        LOG.info("responses_tools_summary tools=%s", ",".join(tool_summaries))
     return (chat_tools or None), custom_tool_names
 
 
 def responses_tool_choice_to_chat(tool_choice: Any) -> Any:
+    if SETTINGS.upstream_tool_choice_mode == "omit_forced":
+        if tool_choice in (None, "auto", "none"):
+            return tool_choice
+        if isinstance(tool_choice, dict) and tool_choice.get("type") in IGNORED_RESPONSES_TOOL_TYPES:
+            return "auto"
+        return None
     if tool_choice in (None, "auto", "none", "required"):
         return tool_choice
     if isinstance(tool_choice, dict):
@@ -466,7 +551,9 @@ def build_chat_payload(payload: dict[str, Any], stream: bool) -> tuple[dict[str,
             raise HTTPException(status_code=400, detail="TokenHub/GLM tool_calls unsupported by probe")
         chat_payload["tools"] = tools
         if "tool_choice" in payload:
-            chat_payload["tool_choice"] = responses_tool_choice_to_chat(payload.get("tool_choice"))
+            tool_choice = responses_tool_choice_to_chat(payload.get("tool_choice"))
+            if tool_choice is not None:
+                chat_payload["tool_choice"] = tool_choice
 
     passthrough = {
         "temperature": "temperature",
@@ -488,8 +575,10 @@ def build_chat_payload(payload: dict[str, Any], stream: bool) -> tuple[dict[str,
 def chat_message_to_response_output(
     message: dict[str, Any],
     custom_tool_names: set[str] | None = None,
+    tool_name_aliases: dict[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     custom_tool_names = custom_tool_names or set()
+    tool_name_aliases = tool_name_aliases or {}
     output: list[dict[str, Any]] = []
     text = message.get("content") or ""
     if text:
@@ -511,7 +600,8 @@ def chat_message_to_response_output(
 
     for raw_tool_call in message.get("tool_calls") or []:
         tool_call = normalize_tool_call(raw_tool_call)
-        name = tool_call["function"].get("name")
+        name = resolve_tool_call_name(tool_call["function"].get("name"), tool_name_aliases)
+        tool_call["function"]["name"] = name
         if name in custom_tool_names:
             output.append(
                 {
@@ -538,7 +628,10 @@ def chat_message_to_response_output(
     return output, text
 
 
-def response_output_to_chat_messages(output: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def response_output_to_chat_messages(
+    output: list[dict[str, Any]],
+    reasoning_content: str = "",
+) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     pending_tool_calls: list[dict[str, Any]] = []
     pending_text: list[str] = []
@@ -554,13 +647,15 @@ def response_output_to_chat_messages(output: list[dict[str, Any]]) -> list[dict[
         elif item_type == "custom_tool_call":
             pending_tool_calls.append(response_custom_tool_call_to_chat_tool_call(item))
 
-    if pending_text or pending_tool_calls:
+    if pending_text or pending_tool_calls or reasoning_content:
         message: dict[str, Any] = {
             "role": "assistant",
             "content": "\n".join(pending_text) if pending_text else None,
         }
         if pending_tool_calls:
             message["tool_calls"] = pending_tool_calls
+        if reasoning_content:
+            message["reasoning_content"] = reasoning_content
         messages.append(message)
     return messages
 
@@ -601,9 +696,15 @@ def build_response_json(
     }
 
 
-def store_response(response_id: str, request_messages: list[dict[str, Any]], output: list[dict[str, Any]]) -> None:
+def store_response(
+    response_id: str,
+    request_messages: list[dict[str, Any]],
+    output: list[dict[str, Any]],
+    reasoning_content: str = "",
+) -> None:
     prune_response_store()
-    messages = [*request_messages, *response_output_to_chat_messages(output)]
+    remember_tool_call_reasoning(output, reasoning_content)
+    messages = [*request_messages, *response_output_to_chat_messages(output, reasoning_content)]
     RESPONSES[response_id] = StoredResponse(
         expires_at=time.time() + SETTINGS.response_ttl_seconds,
         messages=messages,
@@ -625,6 +726,52 @@ def map_httpx_error(status_code: int) -> int:
     return status_code
 
 
+def compact_text(value: str, limit: int = MAX_UPSTREAM_ERROR_DETAIL_CHARS) -> str:
+    text = re.sub(r"\s+", " ", value).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def collect_error_fields(value: Any, prefix: str = "") -> list[str]:
+    fields: list[str] = []
+    if isinstance(value, dict):
+        for key in ("message", "detail", "code", "type", "param"):
+            item = value.get(key)
+            if isinstance(item, (str, int, float, bool)):
+                label = f"{prefix}{key}" if prefix else key
+                fields.append(f"{label}={item}")
+        for key in ("error", "errors"):
+            item = value.get(key)
+            if isinstance(item, (dict, list)):
+                fields.extend(collect_error_fields(item, f"{key}."))
+            elif isinstance(item, str):
+                fields.append(f"{key}={item}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value[:3]):
+            fields.extend(collect_error_fields(item, f"{prefix}{index}."))
+    elif isinstance(value, str):
+        fields.append(value)
+    return fields
+
+
+def sanitized_upstream_error_from_text(status_code: int, text: str) -> str:
+    detail = ""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        detail = text
+    else:
+        fields = collect_error_fields(parsed)
+        detail = "; ".join(fields) if fields else json.dumps(parsed, ensure_ascii=False)
+    detail = compact_text(detail)
+    return f"{upstream_error_detail(status_code)}: {detail}" if detail else upstream_error_detail(status_code)
+
+
+def sanitized_upstream_error_from_response(response: httpx.Response) -> str:
+    return sanitized_upstream_error_from_text(response.status_code, response.text)
+
+
 def upstream_error_detail(status_code: int) -> str:
     if status_code in {401, 403}:
         return "TokenHub authentication failed; check TOKENHUB_API_KEY"
@@ -641,6 +788,8 @@ async def health() -> dict[str, Any]:
         "status": "ok",
         "model": SETTINGS.tokenhub_model,
         "tool_calls_enabled": SETTINGS.enable_tool_calls,
+        "upstream_tool_choice_mode": SETTINGS.upstream_tool_choice_mode,
+        "response_language_instruction_configured": bool(SETTINGS.response_language_instruction),
         "metrics": metrics_snapshot(),
     }
 
@@ -682,7 +831,14 @@ async def create_response(request: Request, authorization: str | None = Header(d
 
     if stream:
         return StreamingResponse(
-            stream_response(request_id, chat_payload, request_messages, custom_tool_names, started),
+            stream_response(
+                request_id,
+                chat_payload,
+                request_messages,
+                custom_tool_names,
+                tool_name_aliases_for_chat_tools(chat_payload.get("tools")),
+                started,
+            ),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
         )
@@ -709,19 +865,26 @@ async def create_response(request: Request, authorization: str | None = Header(d
     if upstream.status_code >= 400:
         record_failed_metrics()
         status_code = map_httpx_error(upstream.status_code)
+        detail = sanitized_upstream_error_from_response(upstream)
         LOG.info(
-            "request_done request_id=%s model=%s status=upstream_error upstream_status=%s elapsed_ms=%d",
+            "request_done request_id=%s model=%s status=upstream_error upstream_status=%s detail=%s elapsed_ms=%d",
             request_id,
             model,
             upstream.status_code,
+            detail,
             int((time.perf_counter() - started) * 1000),
         )
-        raise HTTPException(status_code=status_code, detail=upstream_error_detail(upstream.status_code))
+        raise HTTPException(status_code=status_code, detail=detail)
 
     data = upstream.json()
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
-    output, output_text = chat_message_to_response_output(message, custom_tool_names)
+    reasoning_content = text_from_content(message.get("reasoning_content"))
+    output, output_text = chat_message_to_response_output(
+        message,
+        custom_tool_names,
+        tool_name_aliases_for_chat_tools(chat_payload.get("tools")),
+    )
     response_id = new_id("resp")
     response_json = build_response_json(
         response_id=response_id,
@@ -730,7 +893,7 @@ async def create_response(request: Request, authorization: str | None = Header(d
         output_text=output_text,
         usage=data.get("usage"),
     )
-    store_response(response_id, request_messages, output)
+    store_response(response_id, request_messages, output, reasoning_content)
     record_completed_metrics(output_text, output, data.get("usage"))
     LOG.info(
         "request_done request_id=%s response_id=%s model=%s status=completed elapsed_ms=%d",
@@ -747,6 +910,7 @@ async def stream_response(
     chat_payload: dict[str, Any],
     request_messages: list[dict[str, Any]],
     custom_tool_names: set[str],
+    tool_name_aliases: dict[str, str],
     started: float,
 ) -> AsyncIterator[str]:
     model = chat_payload["model"]
@@ -758,6 +922,7 @@ async def stream_response(
     output: list[dict[str, Any]] = []
     text_item_id: str | None = None
     text_output = ""
+    reasoning_content = ""
     tool_items: dict[str, dict[str, Any]] = {}
     tool_call_order: list[str] = []
 
@@ -774,19 +939,25 @@ async def stream_response(
             ) as upstream:
                 if upstream.status_code >= 400:
                     record_failed_metrics()
+                    error_body = await upstream.aread()
+                    detail = sanitized_upstream_error_from_text(
+                        upstream.status_code,
+                        error_body.decode("utf-8", errors="replace"),
+                    )
                     yield sse(
                         "error",
                         {
                             "type": "error",
                             "code": str(upstream.status_code),
-                            "message": upstream_error_detail(upstream.status_code),
+                            "message": detail,
                         },
                     )
                     LOG.info(
-                        "request_done request_id=%s model=%s status=upstream_error upstream_status=%s elapsed_ms=%d",
+                        "request_done request_id=%s model=%s status=upstream_error upstream_status=%s detail=%s elapsed_ms=%d",
                         request_id,
                         model,
                         upstream.status_code,
+                        detail,
                         int((time.perf_counter() - started) * 1000),
                     )
                     return
@@ -805,6 +976,10 @@ async def stream_response(
                         continue
                     choice = (chunk.get("choices") or [{}])[0]
                     delta = choice.get("delta") or {}
+
+                    reasoning_content_delta = delta.get("reasoning_content") or ""
+                    if reasoning_content_delta:
+                        reasoning_content += str(reasoning_content_delta)
 
                     content_delta = delta.get("content") or ""
                     if content_delta:
@@ -849,7 +1024,7 @@ async def stream_response(
                         if existing is None:
                             call_id = raw_tool_call.get("id") or new_id("call")
                             function = raw_tool_call.get("function") or {}
-                            name = function.get("name") or ""
+                            name = resolve_tool_call_name(function.get("name") or "", tool_name_aliases)
                             is_custom = name in custom_tool_names
                             existing = {
                                 "id": new_id("ctc" if is_custom else "fc"),
@@ -874,7 +1049,7 @@ async def stream_response(
                             )
                         function = raw_tool_call.get("function") or {}
                         if function.get("name") and not existing.get("name"):
-                            existing["name"] = function["name"]
+                            existing["name"] = resolve_tool_call_name(function["name"], tool_name_aliases)
                             if existing["name"] in custom_tool_names and existing.get("type") != "custom_tool_call":
                                 existing["id"] = new_id("ctc")
                                 existing["type"] = "custom_tool_call"
@@ -969,7 +1144,7 @@ async def stream_response(
         yield sse("response.output_item.done", {"type": "response.output_item.done", "output_index": output_index, "item": item})
 
     completed = build_response_json(response_id, model, output, text_output, None, status="completed")
-    store_response(response_id, request_messages, output)
+    store_response(response_id, request_messages, output, reasoning_content)
     record_completed_metrics(text_output, output, None)
     yield sse("response.completed", {"type": "response.completed", "response": completed})
     LOG.info(

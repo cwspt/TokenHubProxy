@@ -5,12 +5,16 @@ os.environ.setdefault("CODEX_GLM_PROXY_KEY", "test-proxy-key")
 os.environ.setdefault("ENABLE_TOOL_CALLS", "true")
 
 from proxy_app.main import (  # noqa: E402
+    SETTINGS,
     build_chat_payload,
     chat_message_to_response_output,
     input_item_to_messages,
     metrics_snapshot,
     record_completed_metrics,
     record_request_metrics,
+    response_output_to_chat_messages,
+    store_response,
+    tool_name_aliases_for_chat_tools,
 )
 
 
@@ -27,6 +31,20 @@ class TransformTests(unittest.TestCase):
             stream=False,
         )
         self.assertEqual(payload["messages"][0], {"role": "system", "content": "be terse"})
+
+    def test_response_language_instruction_is_prepended(self) -> None:
+        original_instruction = SETTINGS.response_language_instruction
+        try:
+            object.__setattr__(SETTINGS, "response_language_instruction", "Reply in Simplified Chinese.")
+            payload, _, _ = build_chat_payload(
+                {"model": "glm-5.1", "instructions": "be terse", "input": "hello"},
+                stream=False,
+            )
+        finally:
+            object.__setattr__(SETTINGS, "response_language_instruction", original_instruction)
+
+        self.assertEqual(payload["messages"][0], {"role": "system", "content": "Reply in Simplified Chinese."})
+        self.assertEqual(payload["messages"][1], {"role": "system", "content": "be terse"})
 
     def test_message_content_array_to_text(self) -> None:
         messages = input_item_to_messages(
@@ -65,6 +83,37 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(output[0]["type"], "function_call")
         self.assertEqual(output[0]["call_id"], "call_1")
         self.assertEqual(output[0]["name"], "get_time")
+
+    def test_shell_tool_call_is_aliased_to_shell_command_when_available(self) -> None:
+        aliases = tool_name_aliases_for_chat_tools(
+            [{"type": "function", "function": {"name": "shell_command"}}]
+        )
+        output, _ = chat_message_to_response_output(
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "shell", "arguments": '{"cmd":"pwd"}'},
+                    }
+                ],
+            },
+            tool_name_aliases=aliases,
+        )
+
+        self.assertEqual(output[0]["type"], "function_call")
+        self.assertEqual(output[0]["name"], "shell_command")
+
+    def test_shell_tool_call_is_not_aliased_when_shell_is_available(self) -> None:
+        aliases = tool_name_aliases_for_chat_tools(
+            [
+                {"type": "function", "function": {"name": "shell"}},
+                {"type": "function", "function": {"name": "shell_command"}},
+            ]
+        )
+        self.assertEqual(aliases, {})
 
     def test_custom_tool_to_chat_function_tool(self) -> None:
         payload, _, custom_tool_names = build_chat_payload(
@@ -124,6 +173,138 @@ class TransformTests(unittest.TestCase):
         )
         self.assertNotIn("tools", payload)
         self.assertEqual(custom_tool_names, set())
+
+    def test_namespace_tool_is_ignored(self) -> None:
+        payload, _, custom_tool_names = build_chat_payload(
+            {
+                "model": "glm-5.1",
+                "input": "hello",
+                "tools": [{"type": "namespace", "name": "browser"}],
+            },
+            stream=False,
+        )
+        self.assertNotIn("tools", payload)
+        self.assertEqual(custom_tool_names, set())
+
+    def test_omit_forced_tool_choice_mode_drops_forced_function_choice(self) -> None:
+        original_mode = SETTINGS.upstream_tool_choice_mode
+        try:
+            object.__setattr__(SETTINGS, "upstream_tool_choice_mode", "omit_forced")
+            payload, _, _ = build_chat_payload(
+                {
+                    "model": "glm-5.1",
+                    "input": "hello",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get_time",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                    "tool_choice": {"type": "function", "name": "get_time"},
+                },
+                stream=False,
+            )
+        finally:
+            object.__setattr__(SETTINGS, "upstream_tool_choice_mode", original_mode)
+
+        self.assertIn("tools", payload)
+        self.assertNotIn("tool_choice", payload)
+
+    def test_omit_forced_tool_choice_mode_drops_required_choice(self) -> None:
+        original_mode = SETTINGS.upstream_tool_choice_mode
+        try:
+            object.__setattr__(SETTINGS, "upstream_tool_choice_mode", "omit_forced")
+            payload, _, _ = build_chat_payload(
+                {
+                    "model": "glm-5.1",
+                    "input": "hello",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get_time",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                    "tool_choice": "required",
+                },
+                stream=False,
+            )
+        finally:
+            object.__setattr__(SETTINGS, "upstream_tool_choice_mode", original_mode)
+
+        self.assertIn("tools", payload)
+        self.assertNotIn("tool_choice", payload)
+
+    def test_passthrough_tool_choice_mode_keeps_forced_function_choice(self) -> None:
+        original_mode = SETTINGS.upstream_tool_choice_mode
+        try:
+            object.__setattr__(SETTINGS, "upstream_tool_choice_mode", "passthrough")
+            payload, _, _ = build_chat_payload(
+                {
+                    "model": "glm-5.1",
+                    "input": "hello",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "get_time",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                    "tool_choice": {"type": "function", "name": "get_time"},
+                },
+                stream=False,
+            )
+        finally:
+            object.__setattr__(SETTINGS, "upstream_tool_choice_mode", original_mode)
+
+        self.assertEqual(payload["tool_choice"], {"type": "function", "function": {"name": "get_time"}})
+
+    def test_response_output_to_chat_messages_preserves_reasoning_content(self) -> None:
+        messages = response_output_to_chat_messages(
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "read_file",
+                    "arguments": '{"path":"README.md"}',
+                }
+            ],
+            reasoning_content="hidden thinking state",
+        )
+
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertEqual(messages[0]["content"], None)
+        self.assertEqual(messages[0]["reasoning_content"], "hidden thinking state")
+        self.assertEqual(messages[0]["tool_calls"][0]["id"], "call_1")
+
+    def test_function_call_input_restores_reasoning_content_by_call_id(self) -> None:
+        store_response(
+            "resp_test_reasoning",
+            [{"role": "user", "content": "read README"}],
+            [
+                {
+                    "type": "function_call",
+                    "call_id": "call_reasoning_1",
+                    "name": "read_file",
+                    "arguments": '{"path":"README.md"}',
+                }
+            ],
+            reasoning_content="hidden thinking state",
+        )
+
+        messages = input_item_to_messages(
+            {
+                "type": "function_call",
+                "call_id": "call_reasoning_1",
+                "name": "read_file",
+                "arguments": '{"path":"README.md"}',
+            }
+        )
+
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertEqual(messages[0]["reasoning_content"], "hidden thinking state")
+        self.assertEqual(messages[0]["tool_calls"][0]["id"], "call_reasoning_1")
 
     def test_metrics_count_text_chars_and_upstream_usage(self) -> None:
         before = metrics_snapshot()

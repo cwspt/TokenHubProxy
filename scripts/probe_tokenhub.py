@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from typing import Any
 
@@ -16,7 +17,59 @@ def env_bool(name: str, default: bool = False) -> bool:
     return value.lower() in {"1", "true", "yes", "on"}
 
 
-def base_payload(model: str, stream: bool, include_tools: bool) -> dict[str, Any]:
+MAX_ERROR_DETAIL_CHARS = 500
+
+
+def compact_text(value: str, limit: int = MAX_ERROR_DETAIL_CHARS) -> str:
+    text = re.sub(r"\s+", " ", value).strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3].rstrip() + "..."
+
+
+def collect_error_fields(value: Any, prefix: str = "") -> list[str]:
+    fields: list[str] = []
+    if isinstance(value, dict):
+        for key in ("message", "detail", "code", "type", "param"):
+            item = value.get(key)
+            if isinstance(item, (str, int, float, bool)):
+                label = f"{prefix}{key}" if prefix else key
+                fields.append(f"{label}={item}")
+        for key in ("error", "errors"):
+            item = value.get(key)
+            if isinstance(item, (dict, list)):
+                fields.extend(collect_error_fields(item, f"{key}."))
+            elif isinstance(item, str):
+                fields.append(f"{key}={item}")
+    elif isinstance(value, list):
+        for index, item in enumerate(value[:3]):
+            fields.extend(collect_error_fields(item, f"{prefix}{index}."))
+    elif isinstance(value, str):
+        fields.append(value)
+    return fields
+
+
+def sanitized_http_error(response: httpx.Response) -> str:
+    detail = ""
+    try:
+        parsed = response.json()
+    except json.JSONDecodeError:
+        detail = response.text
+    else:
+        fields = collect_error_fields(parsed)
+        detail = "; ".join(fields) if fields else json.dumps(parsed, ensure_ascii=False)
+    detail = compact_text(detail)
+    return f"HTTP {response.status_code}: {detail}" if detail else f"HTTP {response.status_code}"
+
+
+def base_payload(
+    model: str,
+    stream: bool,
+    include_tools: bool,
+    *,
+    force_tool_choice: bool = True,
+    strict_empty_schema: bool = True,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": "Reply with exactly: pong"}],
@@ -36,22 +89,42 @@ def base_payload(model: str, stream: bool, include_tools: bool) -> dict[str, Any
                 "function": {
                     "name": "get_time",
                     "description": "Return the current local time.",
-                    "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
+                    "parameters": (
+                        {"type": "object", "properties": {}, "additionalProperties": False}
+                        if strict_empty_schema
+                        else {"type": "object", "properties": {}}
+                    ),
                 },
             }
         ]
-        payload["tool_choice"] = {"type": "function", "function": {"name": "get_time"}}
+        if force_tool_choice:
+            payload["tool_choice"] = {"type": "function", "function": {"name": "get_time"}}
     return payload
 
 
-def post_non_stream(client: httpx.Client, url: str, key: str, model: str, include_tools: bool) -> tuple[bool, str]:
+def post_non_stream(
+    client: httpx.Client,
+    url: str,
+    key: str,
+    model: str,
+    include_tools: bool,
+    *,
+    force_tool_choice: bool = True,
+    strict_empty_schema: bool = True,
+) -> tuple[bool, str]:
     response = client.post(
         url,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json=base_payload(model, stream=False, include_tools=include_tools),
+        json=base_payload(
+            model,
+            stream=False,
+            include_tools=include_tools,
+            force_tool_choice=force_tool_choice,
+            strict_empty_schema=strict_empty_schema,
+        ),
     )
     if response.status_code >= 400:
-        return False, f"HTTP {response.status_code}"
+        return False, sanitized_http_error(response)
     data = response.json()
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
@@ -62,17 +135,33 @@ def post_non_stream(client: httpx.Client, url: str, key: str, model: str, includ
     return ok, "content present" if ok else "no content in message"
 
 
-def post_stream(client: httpx.Client, url: str, key: str, model: str, include_tools: bool) -> tuple[bool, str]:
+def post_stream(
+    client: httpx.Client,
+    url: str,
+    key: str,
+    model: str,
+    include_tools: bool,
+    *,
+    force_tool_choice: bool = True,
+    strict_empty_schema: bool = True,
+) -> tuple[bool, str]:
     saw_text = False
     saw_tool = False
     with client.stream(
         "POST",
         url,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-        json=base_payload(model, stream=True, include_tools=include_tools),
+        json=base_payload(
+            model,
+            stream=True,
+            include_tools=include_tools,
+            force_tool_choice=force_tool_choice,
+            strict_empty_schema=strict_empty_schema,
+        ),
     ) as response:
         if response.status_code >= 400:
-            return False, f"HTTP {response.status_code}"
+            response.read()
+            return False, sanitized_http_error(response)
         for line in response.iter_lines():
             if not line or not line.startswith("data:"):
                 continue
@@ -92,6 +181,31 @@ def post_stream(client: httpx.Client, url: str, key: str, model: str, include_to
     if include_tools:
         return saw_tool, "stream tool_calls present" if saw_tool else "no stream tool_calls"
     return saw_text, "stream content present" if saw_text else "no stream content"
+
+
+def probe_tool_variants(client: httpx.Client, url: str, key: str, model: str) -> None:
+    variants = [
+        ("tool_variant_no_forced_choice", False, True),
+        ("tool_variant_simple_schema", True, False),
+        ("tool_variant_no_forced_choice_simple_schema", False, False),
+    ]
+    for name, force_tool_choice, strict_empty_schema in variants:
+        try:
+            ok, detail = post_non_stream(
+                client,
+                url,
+                key,
+                model,
+                include_tools=True,
+                force_tool_choice=force_tool_choice,
+                strict_empty_schema=strict_empty_schema,
+            )
+        except httpx.HTTPError as exc:
+            ok, detail = False, exc.__class__.__name__
+        print(f"{name}: {'PASS' if ok else 'FAIL'} - {detail}")
+        if ok:
+            print("A compatibility variant passed, but the default Codex proxy tool-call path still remains disabled unless both standard tool-call checks pass.")
+            break
 
 
 def main() -> int:
@@ -130,6 +244,10 @@ def main() -> int:
         print('$env:ENABLE_TOOL_CALLS = "true"')
     else:
         print("Tool-call probe failed. Leave ENABLE_TOOL_CALLS=false; Codex coding-agent use will not be reliable.")
+        print()
+        print("Tool-call compatibility variants:")
+        with httpx.Client(timeout=args.timeout) as client:
+            probe_tool_variants(client, args.url, key, args.model)
 
     return 0 if results.get("non_stream_text") and results.get("stream_text") else 1
 

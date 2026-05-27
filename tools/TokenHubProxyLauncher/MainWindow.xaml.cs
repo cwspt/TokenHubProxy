@@ -24,6 +24,7 @@ public partial class MainWindow : Window
     private static readonly TimeSpan RecoveryMonitorInterval = TimeSpan.FromSeconds(60);
     private readonly List<UpstreamPreset> _upstreamPresets = new();
     private bool _suppressPresetChangeLog;
+    private bool _omitForcedToolChoice;
 
     public MainWindow()
     {
@@ -44,6 +45,7 @@ public partial class MainWindow : Window
         LanguageComboBox.Items.Add("中文");
         LanguageComboBox.Items.Add("English");
         LanguageComboBox.SelectedIndex = 0;
+        InitializeResponseLanguageOptions();
         InitializeUpstreamPresets();
         ApplyLanguage();
         ApplySelectedUpstreamPreset(0, logChange: false);
@@ -84,8 +86,10 @@ public partial class MainWindow : Window
         HostLabel.Content = T("label.host");
         PortLabel.Content = T("label.port");
         TimeoutLabel.Content = T("label.timeout");
+        ResponseLanguageLabel.Content = T("label.responseLanguage");
         EnableToolCallsCheckBox.Content = T("checkbox.enableToolCalls");
         ToolCallsHintTextBlock.Text = T("hint.toolCalls");
+        RefreshResponseLanguageOptions();
         CodexHomeGroupBox.Header = T("group.codexHome");
         DesktopCodexHomeLabel.Content = T("label.desktopHome");
         VsCodeCodexHomeLabel.Content = T("label.vscodeHome");
@@ -123,27 +127,27 @@ public partial class MainWindow : Window
             600));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-chat",
-            "https://api.deepseek.com",
+            "https://api.deepseek.com/chat/completions",
             "deepseek-chat",
             600));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-reasoner",
-            "https://api.deepseek.com",
+            "https://api.deepseek.com/chat/completions",
             "deepseek-reasoner",
             900));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-v3",
-            "https://api.deepseek.com",
+            "https://api.deepseek.com/chat/completions",
             "deepseek-v3",
             600));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-v4-flash",
-            "https://api.deepseek.com",
+            "https://api.deepseek.com/chat/completions",
             "deepseek-v4-flash",
             600));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-v4-pro",
-            "https://api.deepseek.com",
+            "https://api.deepseek.com/chat/completions",
             "deepseek-v4-pro",
             900));
 
@@ -161,6 +165,35 @@ public partial class MainWindow : Window
         }
     }
 
+    private void InitializeResponseLanguageOptions()
+    {
+        ResponseLanguageComboBox.Items.Clear();
+        ResponseLanguageComboBox.Items.Add(new ResponseLanguageOption("zh", "简体中文", "Simplified Chinese"));
+        ResponseLanguageComboBox.Items.Add(new ResponseLanguageOption("auto", "自动", "Auto"));
+        ResponseLanguageComboBox.Items.Add(new ResponseLanguageOption("en", "English", "English"));
+        ResponseLanguageComboBox.SelectedIndex = 0;
+    }
+
+    private void RefreshResponseLanguageOptions()
+    {
+        foreach (var item in ResponseLanguageComboBox.Items.OfType<ResponseLanguageOption>())
+        {
+            item.UseEnglish = _language == "en";
+        }
+        ResponseLanguageComboBox.Items.Refresh();
+    }
+
+    private string ResponseLanguageInstruction()
+    {
+        var option = ResponseLanguageComboBox.SelectedItem as ResponseLanguageOption;
+        return option?.Code switch
+        {
+            "zh" => "除非用户明确要求其他语言，否则所有面向用户的自然语言回复都使用简体中文。代码、命令、文件路径、API 名称、工具名和引用的错误信息保持原文。",
+            "en" => "Respond to the user in English unless the user explicitly asks for another language. Keep code, commands, file paths, API names, tool names, and quoted errors in their original language.",
+            _ => ""
+        };
+    }
+
     private void ApplySelectedUpstreamPreset(int index, bool logChange)
     {
         if (index < 0 || index >= _upstreamPresets.Count)
@@ -175,6 +208,7 @@ public partial class MainWindow : Window
         TokenHubBaseUrlTextBox.Text = preset.BaseUrl;
         TokenHubModelTextBox.Text = preset.Model;
         TimeoutTextBox.Text = preset.TimeoutSeconds.ToString();
+        _omitForcedToolChoice = false;
         if (logChange)
         {
             Log(string.Format(T("log.presetApplied"), preset.DisplayName, preset.BaseUrl, preset.Model, preset.TimeoutSeconds));
@@ -193,7 +227,7 @@ public partial class MainWindow : Window
         return operationName switch
         {
             "install dependencies" => T("op.install"),
-            "probe TokenHub" => T("op.probe"),
+            "probe upstream" => T("op.probe"),
             "monitor recovery" => T("op.monitorRecovery"),
             "start proxy" => T("op.start"),
             "open config" => T("op.openConfig"),
@@ -227,12 +261,14 @@ public partial class MainWindow : Window
     private void UseTokenHubBaseUrlButton_Click(object sender, RoutedEventArgs e)
     {
         TokenHubBaseUrlTextBox.Text = "https://tokenhub.tencentmaas.com/plan/v3/chat/completions";
+        _omitForcedToolChoice = false;
         Log(T("log.baseUrlAppliedTokenHub"));
     }
 
     private void UseDeepSeekBaseUrlButton_Click(object sender, RoutedEventArgs e)
     {
-        TokenHubBaseUrlTextBox.Text = "https://api.deepseek.com";
+        TokenHubBaseUrlTextBox.Text = "https://api.deepseek.com/chat/completions";
+        _omitForcedToolChoice = false;
         Log(T("log.baseUrlAppliedDeepSeek"));
     }
 
@@ -259,7 +295,7 @@ public partial class MainWindow : Window
 
     private async void ProbeButton_Click(object sender, RoutedEventArgs e)
     {
-        await RunBusyAsync("probe TokenHub", async () =>
+        await RunBusyAsync("probe upstream", async () =>
         {
             Log(T("log.probeRequested"));
             var root = ValidateProjectRoot();
@@ -277,11 +313,22 @@ public partial class MainWindow : Window
             var result = await RunCommandCaptureAsync(pythonPath, "scripts\\probe_tokenhub.py", root, BuildProxyEnvironment());
             var toolCallsOk = result.Output.Contains("non_stream_tool_calls: PASS", StringComparison.Ordinal)
                 && result.Output.Contains("stream_tool_calls: PASS", StringComparison.Ordinal);
+            var noForcedToolChoiceOk = result.Output.Contains("tool_variant_no_forced_choice: PASS", StringComparison.Ordinal);
 
-            EnableToolCallsCheckBox.IsChecked = toolCallsOk;
-            Log(toolCallsOk
-                ? T("log.toolProbePassed")
-                : T("log.toolProbeFailed"));
+            _omitForcedToolChoice = !toolCallsOk && noForcedToolChoiceOk;
+            EnableToolCallsCheckBox.IsChecked = toolCallsOk || noForcedToolChoiceOk;
+            if (toolCallsOk)
+            {
+                Log(T("log.toolProbePassed"));
+            }
+            else if (noForcedToolChoiceOk)
+            {
+                Log(T("log.toolProbeNoForcedChoicePassed"));
+            }
+            else
+            {
+                Log(T("log.toolProbeFailed"));
+            }
 
             if (result.ExitCode != 0)
             {
@@ -345,6 +392,7 @@ public partial class MainWindow : Window
                 {
                     await Dispatcher.InvokeAsync(() =>
                     {
+                        _omitForcedToolChoice = false;
                         EnableToolCallsCheckBox.IsChecked = true;
                         Log(T("log.monitorRecovered"));
                         ShowRecoveryNotification();
@@ -382,6 +430,7 @@ public partial class MainWindow : Window
         TokenHubBaseUrlTextBox.Text = preset.BaseUrl;
         TokenHubModelTextBox.Text = preset.Model;
         TimeoutTextBox.Text = preset.TimeoutSeconds.ToString();
+        _omitForcedToolChoice = false;
         Log(string.Format(T("log.presetApplied"), preset.DisplayName, preset.BaseUrl, preset.Model, preset.TimeoutSeconds));
     }
 
@@ -407,6 +456,7 @@ public partial class MainWindow : Window
 
             var env = BuildProxyEnvironment();
             env["ENABLE_TOOL_CALLS"] = EnableToolCallsCheckBox.IsChecked == true ? "true" : "false";
+            env["UPSTREAM_TOOL_CHOICE_MODE"] = _omitForcedToolChoice ? "omit_forced" : "passthrough";
 
             var args = $"-m uvicorn proxy_app.main:app --host {ProxyHostTextBox.Text.Trim()} --port {ProxyPortTextBox.Text.Trim()}";
             _proxyProcess = CreateProcess(pythonPath, args, root, env);
@@ -612,14 +662,26 @@ public partial class MainWindow : Window
     private Dictionary<string, string> BuildProxyEnvironment()
     {
         var env = BuildBaseEnvironment();
+        var selectedPreset = GetSelectedUpstreamPreset();
         env["TOKENHUB_API_KEY"] = NormalizeTokenHubKey(TokenHubApiKeyBox.Password);
-        env["TOKENHUB_BASE_URL"] = GetSelectedUpstreamPreset().BaseUrl;
-        env["TOKENHUB_MODEL"] = GetSelectedUpstreamPreset().Model;
+        env["TOKENHUB_BASE_URL"] = NormalizeUpstreamBaseUrl(
+            string.IsNullOrWhiteSpace(TokenHubBaseUrlTextBox.Text)
+                ? selectedPreset.BaseUrl
+                : TokenHubBaseUrlTextBox.Text.Trim());
+        env["TOKENHUB_MODEL"] = string.IsNullOrWhiteSpace(TokenHubModelTextBox.Text)
+            ? selectedPreset.Model
+            : TokenHubModelTextBox.Text.Trim();
         env["CODEX_GLM_PROXY_KEY"] = CodexProxyKeyTextBox.Text.Trim();
         env["PROXY_HOST"] = ProxyHostTextBox.Text.Trim();
         env["PROXY_PORT"] = ProxyPortTextBox.Text.Trim();
         env["PROXY_REQUEST_TIMEOUT_SECONDS"] = TimeoutTextBox.Text.Trim();
         env["ENABLE_TOOL_CALLS"] = EnableToolCallsCheckBox.IsChecked == true ? "true" : "false";
+        env["UPSTREAM_TOOL_CHOICE_MODE"] = _omitForcedToolChoice ? "omit_forced" : "passthrough";
+        var languageInstruction = ResponseLanguageInstruction();
+        if (!string.IsNullOrWhiteSpace(languageInstruction))
+        {
+            env["RESPONSE_LANGUAGE_INSTRUCTION"] = languageInstruction;
+        }
         return env;
     }
 
@@ -920,6 +982,7 @@ public partial class MainWindow : Window
             return string.Join(
                 Environment.NewLine,
                 string.Format(T("log.healthSummary"), GetString(root, "status"), GetString(root, "model"), GetBool(root, "tool_calls_enabled")),
+                string.Format(T("log.languageInstruction"), GetBool(root, "response_language_instruction_configured")),
                 string.Format(T("log.metricsRequests"), GetInt(requests, "started"), GetInt(requests, "completed"), GetInt(requests, "failed")),
                 string.Format(T("log.metricsChars"), GetInt(chars, "request_text"), GetInt(chars, "response_text"), GetInt(chars, "response_tool_calls"), GetInt(chars, "total_counted")),
                 string.Format(T("log.metricsTokens"), GetInt(usage, "prompt"), GetInt(usage, "completion"), GetInt(usage, "total")),
@@ -1080,6 +1143,17 @@ request_max_retries = 2
             : normalized;
     }
 
+    private static string NormalizeUpstreamBaseUrl(string value)
+    {
+        var normalized = value.Trim().TrimEnd('/');
+        if (normalized.Equals("https://api.deepseek.com", StringComparison.OrdinalIgnoreCase))
+        {
+            return "https://api.deepseek.com/chat/completions";
+        }
+
+        return normalized;
+    }
+
     private UpstreamPreset GetSelectedUpstreamPreset()
     {
         if (UpstreamPresetComboBox.SelectedIndex >= 0 &&
@@ -1233,14 +1307,15 @@ request_max_retries = 2
         ["label.host"] = "主机",
         ["label.port"] = "端口",
         ["label.timeout"] = "超时秒数",
+        ["label.responseLanguage"] = "回复语言",
         ["checkbox.enableToolCalls"] = "启用工具调用",
-        ["hint.toolCalls"] = "先探测 TokenHub。非流式和流式工具调用都通过后，启动器会自动启用工具调用。",
+        ["hint.toolCalls"] = "先探测上游。非流式和流式工具调用都通过后，启动器会自动启用工具调用。",
         ["group.codexHome"] = "隔离 CODEX_HOME 启动",
         ["label.desktopHome"] = "桌面端 CODEX_HOME",
         ["label.vscodeHome"] = "VS Code CODEX_HOME",
         ["group.actions"] = "操作",
         ["button.installDeps"] = "创建 .venv / 安装依赖",
-        ["button.probe"] = "探测 TokenHub",
+        ["button.probe"] = "探测上游",
         ["button.monitorRecovery"] = "监控恢复",
         ["button.stopMonitor"] = "停止监控",
         ["button.startProxy"] = "启动代理",
@@ -1259,7 +1334,7 @@ request_max_retries = 2
         ["status.running"] = "运行中",
         ["status.stopped"] = "已停止",
         ["op.install"] = "安装依赖",
-        ["op.probe"] = "探测 TokenHub",
+        ["op.probe"] = "探测上游",
         ["op.monitorRecovery"] = "监控恢复",
         ["op.start"] = "启动代理",
         ["op.openConfig"] = "打开配置",
@@ -1271,14 +1346,15 @@ request_max_retries = 2
         ["log.venvExists"] = "虚拟环境已存在。",
         ["log.installingDeps"] = "正在安装依赖...",
         ["log.probeRequested"] = "已请求探测。",
-        ["log.probing"] = "正在探测 TokenHub 兼容性...",
+        ["log.probing"] = "正在探测上游兼容性...",
         ["log.toolProbePassed"] = "工具调用探测通过。启动代理时将启用工具调用。",
+        ["log.toolProbeNoForcedChoicePassed"] = "工具调用兼容模式通过：启动代理时将启用工具调用，并省略强制 tool_choice。",
         ["log.toolProbeFailed"] = "工具调用探测未通过。工具调用将保持关闭。",
         ["log.monitorStarted"] = "已启动恢复监控，每 {0} 秒探测一次。",
         ["log.monitorStopped"] = "已停止恢复监控。",
         ["log.monitorProbeAttempt"] = "恢复监控探测第 {0} 次...",
         ["log.monitorStillDown"] = "服务尚未恢复：{0}",
-        ["log.monitorRecovered"] = "TokenHub 探测已恢复正常。",
+        ["log.monitorRecovered"] = "上游探测已恢复正常。",
         ["log.proxyAlreadyRunning"] = "代理已在运行。",
         ["log.proxyExited"] = "代理进程已退出。",
         ["log.proxyExitedCode"] = "代理进程已退出，退出码 {0}。",
@@ -1298,6 +1374,7 @@ request_max_retries = 2
         ["log.proxyTerminationWarning"] = "代理终止警告：{0}: {1}",
         ["log.createdIsolatedConfig"] = "已创建默认隔离 Codex 配置 glm_tokenhub_proxy。",
         ["log.healthSummary"] = "健康状态：{0}，模型：{1}，工具调用：{2}",
+        ["log.languageInstruction"] = "回复语言约束：{0}",
         ["log.metricsRequests"] = "请求数：已开始 {0}，已完成 {1}，失败 {2}",
         ["log.metricsChars"] = "字符数：请求文本 {0}，响应文本 {1}，响应工具调用 {2}，合计 {3}",
         ["log.metricsTokens"] = "上游 usage token：prompt {0}，completion {1}，total {2}",
@@ -1306,10 +1383,10 @@ request_max_retries = 2
         ["log.baseUrlAppliedTokenHub"] = "已填入 TokenHub Base URL。",
         ["log.baseUrlAppliedDeepSeek"] = "已填入 DeepSeek Base URL。",
         ["tooltip.upstreamPreset"] = "当前上游预设：{0}",
-        ["notify.recoveredTitle"] = "TokenHub 服务已恢复",
+        ["notify.recoveredTitle"] = "上游服务已恢复",
         ["notify.recoveredText"] = "探测已全部通过，可以重新启动代理或继续使用 Codex。",
         ["err.missingVenv"] = "缺少虚拟环境。请先点击“创建 .venv / 安装依赖”。",
-        ["err.probeFailed"] = "TokenHub 文本或流式探测失败。请检查 TOKENHUB_API_KEY、Base URL 和模型名。",
+        ["err.probeFailed"] = "上游文本或流式探测失败。请检查 TOKENHUB_API_KEY、Base URL 和模型名。",
         ["err.projectRootMissing"] = "项目根目录不存在。",
         ["err.projectRootInvalid"] = "项目根目录看起来不是 TokenHubResponsesProxy。",
         ["err.tokenhubKeyRequired"] = "必须填写 TOKENHUB_API_KEY。",
@@ -1339,14 +1416,15 @@ request_max_retries = 2
         ["label.host"] = "Host",
         ["label.port"] = "Port",
         ["label.timeout"] = "Timeout seconds",
+        ["label.responseLanguage"] = "Response language",
         ["checkbox.enableToolCalls"] = "Enable tool calls",
-        ["hint.toolCalls"] = "Probe TokenHub first. The launcher enables tool calls automatically when both tool-call checks pass.",
+        ["hint.toolCalls"] = "Probe the upstream first. The launcher enables tool calls automatically when both tool-call checks pass.",
         ["group.codexHome"] = "Isolated CODEX_HOME launchers",
         ["label.desktopHome"] = "Desktop CODEX_HOME",
         ["label.vscodeHome"] = "VS Code CODEX_HOME",
         ["group.actions"] = "Actions",
         ["button.installDeps"] = "Create .venv / Install dependencies",
-        ["button.probe"] = "Probe TokenHub",
+        ["button.probe"] = "Probe upstream",
         ["button.monitorRecovery"] = "Monitor recovery",
         ["button.stopMonitor"] = "Stop monitor",
         ["button.startProxy"] = "Start proxy",
@@ -1365,7 +1443,7 @@ request_max_retries = 2
         ["status.running"] = "Running",
         ["status.stopped"] = "Stopped",
         ["op.install"] = "install dependencies",
-        ["op.probe"] = "probe TokenHub",
+        ["op.probe"] = "probe upstream",
         ["op.monitorRecovery"] = "monitor recovery",
         ["op.start"] = "start proxy",
         ["op.openConfig"] = "open config",
@@ -1377,14 +1455,15 @@ request_max_retries = 2
         ["log.venvExists"] = "Virtual environment already exists.",
         ["log.installingDeps"] = "Installing dependencies...",
         ["log.probeRequested"] = "Probe requested.",
-        ["log.probing"] = "Probing TokenHub compatibility...",
+        ["log.probing"] = "Probing upstream compatibility...",
         ["log.toolProbePassed"] = "Tool-call probe passed. Tool calls will be enabled when starting the proxy.",
+        ["log.toolProbeNoForcedChoicePassed"] = "Tool-call compatibility mode passed. Tool calls will be enabled while omitting forced tool_choice.",
         ["log.toolProbeFailed"] = "Tool-call probe did not pass. Tool calls will remain disabled.",
         ["log.monitorStarted"] = "Recovery monitor started. Probing every {0} seconds.",
         ["log.monitorStopped"] = "Recovery monitor stopped.",
         ["log.monitorProbeAttempt"] = "Recovery monitor probe attempt {0}...",
         ["log.monitorStillDown"] = "Service has not recovered: {0}",
-        ["log.monitorRecovered"] = "TokenHub probe recovered.",
+        ["log.monitorRecovered"] = "Upstream probe recovered.",
         ["log.proxyAlreadyRunning"] = "Proxy is already running.",
         ["log.proxyExited"] = "Proxy process exited.",
         ["log.proxyExitedCode"] = "Proxy process exited with code {0}.",
@@ -1404,6 +1483,7 @@ request_max_retries = 2
         ["log.proxyTerminationWarning"] = "Proxy termination warning: {0}: {1}",
         ["log.createdIsolatedConfig"] = "Created default isolated Codex config for glm_tokenhub_proxy.",
         ["log.healthSummary"] = "Health: {0}, model: {1}, tool calls: {2}",
+        ["log.languageInstruction"] = "Response language instruction: {0}",
         ["log.metricsRequests"] = "Requests: started {0}, completed {1}, failed {2}",
         ["log.metricsChars"] = "Chars: request text {0}, response text {1}, response tool calls {2}, total {3}",
         ["log.metricsTokens"] = "Upstream usage tokens: prompt {0}, completion {1}, total {2}",
@@ -1412,10 +1492,10 @@ request_max_retries = 2
         ["log.baseUrlAppliedTokenHub"] = "TokenHub Base URL applied.",
         ["log.baseUrlAppliedDeepSeek"] = "DeepSeek Base URL applied.",
         ["tooltip.upstreamPreset"] = "Current upstream preset: {0}",
-        ["notify.recoveredTitle"] = "TokenHub service recovered",
+        ["notify.recoveredTitle"] = "Upstream service recovered",
         ["notify.recoveredText"] = "All probe checks passed. You can restart the proxy or continue using Codex.",
         ["err.missingVenv"] = "Virtual environment is missing. Run Create .venv / Install dependencies first.",
-        ["err.probeFailed"] = "TokenHub text or stream probe failed. Check TOKENHUB_API_KEY, base URL, and model.",
+        ["err.probeFailed"] = "Upstream text or stream probe failed. Check TOKENHUB_API_KEY, base URL, and model.",
         ["err.projectRootMissing"] = "Project root does not exist.",
         ["err.projectRootInvalid"] = "Project root does not look like TokenHubResponsesProxy.",
         ["err.tokenhubKeyRequired"] = "TOKENHUB_API_KEY is required.",
@@ -1425,6 +1505,11 @@ request_max_retries = 2
 
     private sealed record CommandResult(int ExitCode, string Output);
     private sealed record CodexHomeInfo(string Home, string Config);
+    private sealed record ResponseLanguageOption(string Code, string ZhName, string EnName)
+    {
+        public bool UseEnglish { get; set; }
+        public override string ToString() => UseEnglish ? EnName : ZhName;
+    }
     private sealed record UpstreamPreset(string DisplayName, string BaseUrl, string Model, int TimeoutSeconds)
     {
         public override string ToString() => DisplayName;

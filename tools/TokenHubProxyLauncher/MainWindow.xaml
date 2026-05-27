@@ -147,8 +147,11 @@
                             <Label x:Name="TimeoutLabel" Content="Timeout seconds" />
                             <TextBox x:Name="TimeoutTextBox" Text="600" />
 
+                            <Label x:Name="ResponseLanguageLabel" Content="Response language" />
+                            <ComboBox x:Name="ResponseLanguageComboBox" Height="30" />
+
                             <CheckBox x:Name="EnableToolCallsCheckBox" Content="Enable tool calls" IsEnabled="False" Margin="0,10,0,0" />
-                            <TextBlock x:Name="ToolCallsHintTextBlock" Text="Probe TokenHub first. The launcher enables tool calls automatically when both tool-call checks pass." TextWrapping="Wrap" Foreground="#697386" FontSize="12" Margin="0,4,0,0" />
+                            <TextBlock x:Name="ToolCallsHintTextBlock" Text="Probe upstream first. The launcher enables tool calls automatically when both tool-call checks pass." TextWrapping="Wrap" Foreground="#697386" FontSize="12" Margin="0,4,0,0" />
                         </StackPanel>
                     </GroupBox>
 
@@ -172,7 +175,7 @@
                 <GroupBox x:Name="ActionsGroupBox" Grid.Row="0" Header="Actions" Padding="12" Margin="0,0,0,12">
                     <WrapPanel>
                         <Button x:Name="InstallDependenciesButton" Content="Create .venv / Install dependencies" Width="220" Click="InstallDependenciesButton_Click" />
-                        <Button x:Name="ProbeButton" Content="Probe TokenHub" Width="142" Click="ProbeButton_Click" />
+                        <Button x:Name="ProbeButton" Content="Probe upstream" Width="142" Click="ProbeButton_Click" />
                         <Button x:Name="RecoveryMonitorButton" Content="Monitor recovery" Width="154" Click="RecoveryMonitorButton_Click" />
                         <Button x:Name="StartProxyButton" Content="Start proxy" Width="112" Click="StartProxyButton_Click" />
                         <Button x:Name="StopProxyButton" Content="Stop proxy" Width="112" IsEnabled="False" Click="StopProxyButton_Click" />

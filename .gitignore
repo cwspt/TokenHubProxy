@@ -9,3 +9,5 @@ __pycache__/
 !.env.example
 *.log
 dist/
+tools/TokenHubProxyLauncher/obj
+tools/TokenHubProxyLauncher/bin

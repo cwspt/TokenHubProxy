@@ -8,7 +8,11 @@ from proxy_app.main import (  # noqa: E402
     SETTINGS,
     build_chat_payload,
     chat_message_to_response_output,
+    drop_tool_call_blocks_by_ids,
     input_item_to_messages,
+    missing_tool_call_ids_from_error_detail,
+    normalize_chat_messages_for_upstream,
+    normalize_tool_call_ids_for_upstream,
     metrics_snapshot,
     record_completed_metrics,
     record_request_metrics,
@@ -64,6 +68,201 @@ class TransformTests(unittest.TestCase):
             {"type": "function_call_output", "call_id": "call_1", "output": "done"}
         )
         self.assertEqual(messages, [{"role": "tool", "tool_call_id": "call_1", "content": "done"}])
+
+    def test_normalize_chat_messages_keeps_complete_tool_call_block(self) -> None:
+        messages = normalize_chat_messages_for_upstream(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+                {"role": "user", "content": "continue"},
+            ]
+        )
+
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertEqual(messages[1]["role"], "tool")
+
+    def test_normalize_chat_messages_accepts_tool_call_id_alias(self) -> None:
+        messages = normalize_chat_messages_for_upstream(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "tool_call_id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+            ]
+        )
+
+        self.assertEqual(len(messages), 2)
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertEqual(messages[1]["role"], "tool")
+
+    def test_normalize_chat_messages_drops_incomplete_tool_call_block(self) -> None:
+        messages = normalize_chat_messages_for_upstream(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "user", "content": "continue"},
+            ]
+        )
+
+        self.assertEqual(messages, [{"role": "user", "content": "continue"}])
+
+    def test_normalize_chat_messages_drops_tool_call_block_without_ids(self) -> None:
+        messages = normalize_chat_messages_for_upstream(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+                {"role": "user", "content": "continue"},
+            ]
+        )
+
+        self.assertEqual(messages, [{"role": "user", "content": "continue"}])
+
+    def test_normalize_chat_messages_drops_orphan_tool_message(self) -> None:
+        messages = normalize_chat_messages_for_upstream(
+            [
+                {"role": "tool", "tool_call_id": "call_1", "content": "done"},
+                {"role": "user", "content": "continue"},
+            ]
+        )
+
+        self.assertEqual(messages, [{"role": "user", "content": "continue"}])
+
+    def test_missing_tool_call_ids_can_repair_incomplete_history(self) -> None:
+        detail = (
+            "TokenHub upstream request failed: error.message=An assistant message with "
+            "'tool_calls' must be followed by tool messages responding to each "
+            "'tool_call_id', The following tool_call_ids did not have response messages: "
+            "call_1; error.code=invalid_request_error"
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "tool_call_id": "call_1",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "user", "content": "continue"},
+        ]
+
+        repaired = drop_tool_call_blocks_by_ids(
+            messages,
+            missing_tool_call_ids_from_error_detail(detail),
+        )
+
+        self.assertEqual(repaired, [{"role": "user", "content": "continue"}])
+
+    def test_missing_tool_call_repair_falls_back_to_drop_all_tool_blocks(self) -> None:
+        messages = [
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "other_call",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "other_call", "content": "done"},
+            {"role": "user", "content": "continue"},
+        ]
+
+        repaired = drop_tool_call_blocks_by_ids(messages, {"missing_call"})
+
+        self.assertEqual(repaired, [{"role": "user", "content": "continue"}])
+
+    def test_normalize_tool_call_ids_for_upstream_rewrites_matching_tool_messages(self) -> None:
+        messages = normalize_tool_call_ids_for_upstream(
+            [
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": "019e3a5adf010f55b528fcf572023c0e",
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "019e3a5adf010f55b528fcf572023c0e",
+                    "content": "done",
+                },
+            ]
+        )
+
+        self.assertEqual(messages[0]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(messages[1]["tool_call_id"], "call_1")
+
+    def test_build_chat_payload_uses_short_tool_call_ids_for_history(self) -> None:
+        payload, _, _ = build_chat_payload(
+            {
+                "model": "minimax-m-2-7",
+                "input": [
+                    {
+                        "type": "function_call",
+                        "call_id": "019e3a5adf010f55b528fcf572023c0e",
+                        "name": "read_file",
+                        "arguments": "{}",
+                    },
+                    {
+                        "type": "function_call_output",
+                        "call_id": "019e3a5adf010f55b528fcf572023c0e",
+                        "output": "done",
+                    },
+                    {"role": "user", "content": "continue"},
+                ],
+            },
+            stream=False,
+        )
+
+        self.assertEqual(payload["messages"][0]["tool_calls"][0]["id"], "call_1")
+        self.assertEqual(payload["messages"][1]["tool_call_id"], "call_1")
 
     def test_chat_tool_call_to_response_function_call(self) -> None:
         output, text = chat_message_to_response_output(

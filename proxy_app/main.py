@@ -537,8 +537,209 @@ def responses_tool_choice_to_chat(tool_choice: Any) -> Any:
     return tool_choice
 
 
+def message_tool_call_ids(message: dict[str, Any]) -> set[str]:
+    call_ids: set[str] = set()
+    for call in message.get("tool_calls") or []:
+        if not isinstance(call, dict):
+            continue
+        call_id = call.get("id") or call.get("call_id") or call.get("tool_call_id")
+        if call_id:
+            call_ids.add(str(call_id))
+    return call_ids
+
+
+def message_has_tool_calls(message: dict[str, Any]) -> bool:
+    return bool(message.get("tool_calls"))
+
+
+def normalize_chat_messages_for_upstream(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    normalized: list[dict[str, Any]] = []
+    dropped_orphan_tool_messages = 0
+    dropped_incomplete_tool_blocks = 0
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") == "tool":
+            dropped_orphan_tool_messages += 1
+            index += 1
+            continue
+
+        expected_tool_call_ids = message_tool_call_ids(message)
+        if message.get("role") != "assistant" or not message_has_tool_calls(message):
+            normalized.append(message)
+            index += 1
+            continue
+
+        tool_messages: list[dict[str, Any]] = []
+        seen_tool_call_ids: set[str] = set()
+        cursor = index + 1
+        while cursor < len(messages) and messages[cursor].get("role") == "tool":
+            tool_message = messages[cursor]
+            tool_call_id = tool_message.get("tool_call_id")
+            if tool_call_id:
+                seen_tool_call_ids.add(str(tool_call_id))
+            tool_messages.append(tool_message)
+            cursor += 1
+
+        if expected_tool_call_ids and expected_tool_call_ids.issubset(seen_tool_call_ids):
+            normalized.append(message)
+            normalized.extend(tool_messages)
+        else:
+            dropped_incomplete_tool_blocks += 1
+            dropped_orphan_tool_messages += len(tool_messages)
+        index = cursor
+
+    if dropped_orphan_tool_messages or dropped_incomplete_tool_blocks:
+        LOG.info(
+            "normalized_chat_messages dropped_incomplete_tool_blocks=%s dropped_orphan_tool_messages=%s",
+            dropped_incomplete_tool_blocks,
+            dropped_orphan_tool_messages,
+        )
+    return normalized
+
+
+def missing_tool_call_ids_from_error_detail(detail: str) -> set[str]:
+    match = re.search(r"tool_call_ids did not have response messages:\s*([^;]+)", detail)
+    if not match:
+        return set()
+    return {
+        item.strip().strip("`'\"")
+        for item in re.split(r"[\s,]+", match.group(1))
+        if item.strip().strip("`'\"")
+    }
+
+
+def drop_tool_call_blocks_by_ids(
+    messages: list[dict[str, Any]],
+    missing_tool_call_ids: set[str],
+) -> list[dict[str, Any]]:
+    if not missing_tool_call_ids:
+        return messages
+    repaired: list[dict[str, Any]] = []
+    dropped_blocks = 0
+    dropped_tool_messages = 0
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        tool_call_ids = message_tool_call_ids(message)
+        if message.get("role") != "assistant" or not tool_call_ids.intersection(missing_tool_call_ids):
+            repaired.append(message)
+            index += 1
+            continue
+
+        dropped_blocks += 1
+        index += 1
+        while index < len(messages) and messages[index].get("role") == "tool":
+            dropped_tool_messages += 1
+            index += 1
+
+    if dropped_blocks == 0:
+        fallback = drop_all_tool_call_blocks(messages)
+        LOG.info(
+            "repaired_missing_tool_call_blocks missing_tool_call_ids=%s dropped_blocks=0 fallback_drop_all_tool_blocks=true",
+            ",".join(sorted(missing_tool_call_ids)),
+        )
+        return fallback
+
+    LOG.info(
+        "repaired_missing_tool_call_blocks missing_tool_call_ids=%s dropped_blocks=%s dropped_tool_messages=%s",
+        ",".join(sorted(missing_tool_call_ids)),
+        dropped_blocks,
+        dropped_tool_messages,
+    )
+    return repaired
+
+
+def drop_all_tool_call_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    repaired: list[dict[str, Any]] = []
+    dropped_blocks = 0
+    dropped_tool_messages = 0
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") == "tool":
+            dropped_tool_messages += 1
+            index += 1
+            continue
+
+        if message.get("role") != "assistant" or not message_has_tool_calls(message):
+            repaired.append(message)
+            index += 1
+            continue
+
+        dropped_blocks += 1
+        index += 1
+        while index < len(messages) and messages[index].get("role") == "tool":
+            dropped_tool_messages += 1
+            index += 1
+
+    LOG.info(
+        "dropped_all_tool_call_blocks dropped_blocks=%s dropped_tool_messages=%s",
+        dropped_blocks,
+        dropped_tool_messages,
+    )
+    return repaired
+
+
+def normalize_tool_call_ids_for_upstream(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    id_map: dict[str, str] = {}
+    normalized: list[dict[str, Any]] = []
+    next_id = 1
+    renamed_tool_calls = 0
+    renamed_tool_messages = 0
+
+    for message in messages:
+        copied = dict(message)
+        tool_calls = copied.get("tool_calls")
+        if isinstance(tool_calls, list):
+            normalized_tool_calls: list[Any] = []
+            for call in tool_calls:
+                if not isinstance(call, dict):
+                    normalized_tool_calls.append(call)
+                    continue
+                old_id = call.get("id") or call.get("call_id") or call.get("tool_call_id")
+                if not old_id:
+                    normalized_tool_calls.append(call)
+                    continue
+                old_id_text = str(old_id)
+                new_id = id_map.get(old_id_text)
+                if not new_id:
+                    new_id = f"call_{next_id}"
+                    next_id += 1
+                    id_map[old_id_text] = new_id
+                normalized_call = dict(call)
+                normalized_call["id"] = new_id
+                normalized_call.pop("call_id", None)
+                normalized_call.pop("tool_call_id", None)
+                normalized_tool_calls.append(normalized_call)
+                if old_id_text != new_id:
+                    renamed_tool_calls += 1
+            copied["tool_calls"] = normalized_tool_calls
+
+        tool_call_id = copied.get("tool_call_id")
+        if tool_call_id:
+            old_id_text = str(tool_call_id)
+            new_id = id_map.get(old_id_text)
+            if new_id:
+                copied["tool_call_id"] = new_id
+                if old_id_text != new_id:
+                    renamed_tool_messages += 1
+
+        normalized.append(copied)
+
+    if renamed_tool_calls or renamed_tool_messages:
+        LOG.info(
+            "normalized_tool_call_ids renamed_tool_calls=%s renamed_tool_messages=%s",
+            renamed_tool_calls,
+            renamed_tool_messages,
+        )
+    return normalized
+
+
 def build_chat_payload(payload: dict[str, Any], stream: bool) -> tuple[dict[str, Any], list[dict[str, Any]], set[str]]:
-    messages = responses_input_to_messages(payload)
+    messages = normalize_tool_call_ids_for_upstream(
+        normalize_chat_messages_for_upstream(responses_input_to_messages(payload))
+    )
     chat_payload: dict[str, Any] = {
         "model": os.getenv("TOKENHUB_MODEL", payload.get("model") or SETTINGS.tokenhub_model),
         "messages": messages,
@@ -844,37 +1045,51 @@ async def create_response(request: Request, authorization: str | None = Header(d
         )
 
     async with httpx.AsyncClient(timeout=SETTINGS.request_timeout_seconds) as client:
-        try:
-            upstream = await client.post(
-                SETTINGS.tokenhub_base_url,
-                headers={
-                    "Authorization": f"Bearer {SETTINGS.tokenhub_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=chat_payload,
-            )
-        except httpx.TimeoutException:
-            record_failed_metrics()
-            LOG.info("request_done request_id=%s model=%s status=timeout elapsed_ms=%d", request_id, model, int((time.perf_counter() - started) * 1000))
-            raise HTTPException(status_code=504, detail="TokenHub upstream request timed out") from None
-        except httpx.HTTPError:
-            record_failed_metrics()
-            LOG.info("request_done request_id=%s model=%s status=http_error elapsed_ms=%d", request_id, model, int((time.perf_counter() - started) * 1000))
-            raise HTTPException(status_code=502, detail="TokenHub upstream connection failed") from None
+        for attempt in range(2):
+            try:
+                upstream = await client.post(
+                    SETTINGS.tokenhub_base_url,
+                    headers={
+                        "Authorization": f"Bearer {SETTINGS.tokenhub_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=chat_payload,
+                )
+            except httpx.TimeoutException:
+                record_failed_metrics()
+                LOG.info("request_done request_id=%s model=%s status=timeout elapsed_ms=%d", request_id, model, int((time.perf_counter() - started) * 1000))
+                raise HTTPException(status_code=504, detail="TokenHub upstream request timed out") from None
+            except httpx.HTTPError:
+                record_failed_metrics()
+                LOG.info("request_done request_id=%s model=%s status=http_error elapsed_ms=%d", request_id, model, int((time.perf_counter() - started) * 1000))
+                raise HTTPException(status_code=502, detail="TokenHub upstream connection failed") from None
 
-    if upstream.status_code >= 400:
-        record_failed_metrics()
-        status_code = map_httpx_error(upstream.status_code)
-        detail = sanitized_upstream_error_from_response(upstream)
-        LOG.info(
-            "request_done request_id=%s model=%s status=upstream_error upstream_status=%s detail=%s elapsed_ms=%d",
-            request_id,
-            model,
-            upstream.status_code,
-            detail,
-            int((time.perf_counter() - started) * 1000),
-        )
-        raise HTTPException(status_code=status_code, detail=detail)
+            if upstream.status_code < 400:
+                break
+
+            detail = sanitized_upstream_error_from_response(upstream)
+            missing_tool_call_ids = missing_tool_call_ids_from_error_detail(detail)
+            if attempt == 0 and missing_tool_call_ids:
+                chat_payload = {
+                    **chat_payload,
+                    "messages": drop_tool_call_blocks_by_ids(
+                        chat_payload.get("messages") or [],
+                        missing_tool_call_ids,
+                    ),
+                }
+                continue
+
+            record_failed_metrics()
+            status_code = map_httpx_error(upstream.status_code)
+            LOG.info(
+                "request_done request_id=%s model=%s status=upstream_error upstream_status=%s detail=%s elapsed_ms=%d",
+                request_id,
+                model,
+                upstream.status_code,
+                detail,
+                int((time.perf_counter() - started) * 1000),
+            )
+            raise HTTPException(status_code=status_code, detail=detail)
 
     data = upstream.json()
     choice = (data.get("choices") or [{}])[0]
@@ -928,145 +1143,158 @@ async def stream_response(
 
     try:
         async with httpx.AsyncClient(timeout=SETTINGS.request_timeout_seconds) as client:
-            async with client.stream(
-                "POST",
-                SETTINGS.tokenhub_base_url,
-                headers={
-                    "Authorization": f"Bearer {SETTINGS.tokenhub_api_key}",
-                    "Content-Type": "application/json",
-                },
-                json=chat_payload,
-            ) as upstream:
-                if upstream.status_code >= 400:
-                    record_failed_metrics()
-                    error_body = await upstream.aread()
-                    detail = sanitized_upstream_error_from_text(
-                        upstream.status_code,
-                        error_body.decode("utf-8", errors="replace"),
-                    )
-                    yield sse(
-                        "error",
-                        {
-                            "type": "error",
-                            "code": str(upstream.status_code),
-                            "message": detail,
-                        },
-                    )
-                    LOG.info(
-                        "request_done request_id=%s model=%s status=upstream_error upstream_status=%s detail=%s elapsed_ms=%d",
-                        request_id,
-                        model,
-                        upstream.status_code,
-                        detail,
-                        int((time.perf_counter() - started) * 1000),
-                    )
-                    return
-
-                async for line in upstream.aiter_lines():
-                    if not line:
-                        continue
-                    if not line.startswith("data:"):
-                        continue
-                    raw = line.removeprefix("data:").strip()
-                    if raw == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(raw)
-                    except json.JSONDecodeError:
-                        continue
-                    choice = (chunk.get("choices") or [{}])[0]
-                    delta = choice.get("delta") or {}
-
-                    reasoning_content_delta = delta.get("reasoning_content") or ""
-                    if reasoning_content_delta:
-                        reasoning_content += str(reasoning_content_delta)
-
-                    content_delta = delta.get("content") or ""
-                    if content_delta:
-                        if text_item_id is None:
-                            text_item_id = new_id("msg")
-                            item = {
-                                "id": text_item_id,
-                                "type": "message",
-                                "status": "in_progress",
-                                "role": "assistant",
-                                "content": [],
+            for attempt in range(2):
+                async with client.stream(
+                    "POST",
+                    SETTINGS.tokenhub_base_url,
+                    headers={
+                        "Authorization": f"Bearer {SETTINGS.tokenhub_api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=chat_payload,
+                ) as upstream:
+                    if upstream.status_code >= 400:
+                        error_body = await upstream.aread()
+                        detail = sanitized_upstream_error_from_text(
+                            upstream.status_code,
+                            error_body.decode("utf-8", errors="replace"),
+                        )
+                        missing_tool_call_ids = missing_tool_call_ids_from_error_detail(detail)
+                        if attempt == 0 and missing_tool_call_ids:
+                            chat_payload = {
+                                **chat_payload,
+                                "messages": drop_tool_call_blocks_by_ids(
+                                    chat_payload.get("messages") or [],
+                                    missing_tool_call_ids,
+                                ),
                             }
+                            continue
+
+                        record_failed_metrics()
+                        yield sse(
+                            "error",
+                            {
+                                "type": "error",
+                                "code": str(upstream.status_code),
+                                "message": detail,
+                            },
+                        )
+                        LOG.info(
+                            "request_done request_id=%s model=%s status=upstream_error upstream_status=%s detail=%s elapsed_ms=%d",
+                            request_id,
+                            model,
+                            upstream.status_code,
+                            detail,
+                            int((time.perf_counter() - started) * 1000),
+                        )
+                        return
+
+                    async for line in upstream.aiter_lines():
+                        if not line:
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        raw = line.removeprefix("data:").strip()
+                        if raw == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+                        choice = (chunk.get("choices") or [{}])[0]
+                        delta = choice.get("delta") or {}
+
+                        reasoning_content_delta = delta.get("reasoning_content") or ""
+                        if reasoning_content_delta:
+                            reasoning_content += str(reasoning_content_delta)
+
+                        content_delta = delta.get("content") or ""
+                        if content_delta:
+                            if text_item_id is None:
+                                text_item_id = new_id("msg")
+                                item = {
+                                    "id": text_item_id,
+                                    "type": "message",
+                                    "status": "in_progress",
+                                    "role": "assistant",
+                                    "content": [],
+                                }
+                                yield sse(
+                                    "response.output_item.added",
+                                    {"type": "response.output_item.added", "output_index": 0, "item": item},
+                                )
+                                yield sse(
+                                    "response.content_part.added",
+                                    {
+                                        "type": "response.content_part.added",
+                                        "item_id": text_item_id,
+                                        "output_index": 0,
+                                        "content_index": 0,
+                                        "part": {"type": "output_text", "text": "", "annotations": []},
+                                    },
+                                )
+                            text_output += content_delta
                             yield sse(
-                                "response.output_item.added",
-                                {"type": "response.output_item.added", "output_index": 0, "item": item},
-                            )
-                            yield sse(
-                                "response.content_part.added",
+                                "response.output_text.delta",
                                 {
-                                    "type": "response.content_part.added",
+                                    "type": "response.output_text.delta",
                                     "item_id": text_item_id,
                                     "output_index": 0,
                                     "content_index": 0,
-                                    "part": {"type": "output_text", "text": "", "annotations": []},
+                                    "delta": content_delta,
                                 },
                             )
-                        text_output += content_delta
-                        yield sse(
-                            "response.output_text.delta",
-                            {
-                                "type": "response.output_text.delta",
-                                "item_id": text_item_id,
-                                "output_index": 0,
-                                "content_index": 0,
-                                "delta": content_delta,
-                            },
-                        )
 
-                    for raw_tool_call in delta.get("tool_calls") or []:
-                        index = str(raw_tool_call.get("index", len(tool_call_order)))
-                        existing = tool_items.get(index)
-                        if existing is None:
-                            call_id = raw_tool_call.get("id") or new_id("call")
-                            function = raw_tool_call.get("function") or {}
-                            name = resolve_tool_call_name(function.get("name") or "", tool_name_aliases)
-                            is_custom = name in custom_tool_names
-                            existing = {
-                                "id": new_id("ctc" if is_custom else "fc"),
-                                "type": "custom_tool_call" if is_custom else "function_call",
-                                "status": "in_progress",
-                                "call_id": call_id,
-                                "name": name,
-                                "arguments": "",
-                            }
-                            if is_custom:
-                                existing["input"] = ""
-                            tool_items[index] = existing
-                            tool_call_order.append(index)
-                            output_index = (1 if text_item_id is not None else 0) + len(tool_call_order) - 1
-                            yield sse(
-                                "response.output_item.added",
-                                {
-                                    "type": "response.output_item.added",
-                                    "output_index": output_index,
-                                    "item": existing,
-                                },
-                            )
-                        function = raw_tool_call.get("function") or {}
-                        if function.get("name") and not existing.get("name"):
-                            existing["name"] = resolve_tool_call_name(function["name"], tool_name_aliases)
-                            if existing["name"] in custom_tool_names and existing.get("type") != "custom_tool_call":
-                                existing["id"] = new_id("ctc")
-                                existing["type"] = "custom_tool_call"
-                                existing["input"] = ""
-                        arg_delta = function.get("arguments") or ""
-                        if arg_delta:
-                            existing["arguments"] += arg_delta
-                            if existing.get("type") != "custom_tool_call":
+                        for raw_tool_call in delta.get("tool_calls") or []:
+                            index = str(raw_tool_call.get("index", len(tool_call_order)))
+                            existing = tool_items.get(index)
+                            if existing is None:
+                                call_id = raw_tool_call.get("id") or new_id("call")
+                                function = raw_tool_call.get("function") or {}
+                                name = resolve_tool_call_name(function.get("name") or "", tool_name_aliases)
+                                is_custom = name in custom_tool_names
+                                existing = {
+                                    "id": new_id("ctc" if is_custom else "fc"),
+                                    "type": "custom_tool_call" if is_custom else "function_call",
+                                    "status": "in_progress",
+                                    "call_id": call_id,
+                                    "name": name,
+                                    "arguments": "",
+                                }
+                                if is_custom:
+                                    existing["input"] = ""
+                                tool_items[index] = existing
+                                tool_call_order.append(index)
+                                output_index = (1 if text_item_id is not None else 0) + len(tool_call_order) - 1
                                 yield sse(
-                                    "response.function_call_arguments.delta",
+                                    "response.output_item.added",
                                     {
-                                        "type": "response.function_call_arguments.delta",
-                                        "item_id": existing["id"],
-                                        "output_index": (1 if text_item_id is not None else 0) + tool_call_order.index(index),
-                                        "delta": arg_delta,
+                                        "type": "response.output_item.added",
+                                        "output_index": output_index,
+                                        "item": existing,
                                     },
                                 )
+                            function = raw_tool_call.get("function") or {}
+                            if function.get("name") and not existing.get("name"):
+                                existing["name"] = resolve_tool_call_name(function["name"], tool_name_aliases)
+                                if existing["name"] in custom_tool_names and existing.get("type") != "custom_tool_call":
+                                    existing["id"] = new_id("ctc")
+                                    existing["type"] = "custom_tool_call"
+                                    existing["input"] = ""
+                            arg_delta = function.get("arguments") or ""
+                            if arg_delta:
+                                existing["arguments"] += arg_delta
+                                if existing.get("type") != "custom_tool_call":
+                                    yield sse(
+                                        "response.function_call_arguments.delta",
+                                        {
+                                            "type": "response.function_call_arguments.delta",
+                                            "item_id": existing["id"],
+                                            "output_index": (1 if text_item_id is not None else 0) + tool_call_order.index(index),
+                                            "delta": arg_delta,
+                                        },
+                                    )
+                    break
     except httpx.TimeoutException:
         record_failed_metrics()
         yield sse("error", {"type": "error", "code": "timeout", "message": "TokenHub upstream request timed out"})

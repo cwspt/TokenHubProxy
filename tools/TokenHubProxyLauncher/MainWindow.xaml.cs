@@ -150,6 +150,21 @@ public partial class MainWindow : Window
             "https://api.deepseek.com/chat/completions",
             "deepseek-v4-pro",
             900));
+        _upstreamPresets.Add(new UpstreamPreset(
+            "Vinno DeepSeek Relay / deepseek-v4-pro",
+            "https://t.vinno.com/v1/chat/completions",
+            "deepseek-v4-pro",
+            900));
+        _upstreamPresets.Add(new UpstreamPreset(
+            "Vinno DeepSeek Relay / glm-5-1",
+            "https://t.vinno.com/v1/chat/completions",
+            "glm-5-1",
+            900));
+        _upstreamPresets.Add(new UpstreamPreset(
+            "Vinno DeepSeek Relay / minimax-m-2-7",
+            "https://t.vinno.com/v1/chat/completions",
+            "minimax-m-2-7",
+            900));
 
         UpstreamPresetComboBox.Items.Clear();
         foreach (var preset in _upstreamPresets)

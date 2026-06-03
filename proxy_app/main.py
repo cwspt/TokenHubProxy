@@ -352,6 +352,8 @@ def input_item_to_messages(item: dict[str, Any]) -> list[dict[str, Any]]:
             message["tool_call_id"] = item["tool_call_id"]
         if item.get("tool_calls"):
             message["tool_calls"] = [normalize_tool_call(call) for call in item["tool_calls"]]
+        if role == "assistant" and item.get("reasoning_content"):
+            message["reasoning_content"] = text_from_content(item.get("reasoning_content"))
         return [message]
 
     if item_type == "function_call_output":
@@ -400,7 +402,19 @@ def input_item_to_messages(item: dict[str, Any]) -> list[dict[str, Any]]:
             message["reasoning_content"] = reasoning_content
         return [message]
 
-    if item_type in {"reasoning", "summary"}:
+    if item_type == "reasoning":
+        reasoning_text = ""
+        for summary in item.get("summary") or []:
+            if summary.get("text"):
+                if not reasoning_text:
+                    reasoning_text = summary["text"]
+                else:
+                    reasoning_text += "\n" + summary["text"]
+        if reasoning_text:
+            return [{"role": "assistant", "content": None, "_reasoning_content": reasoning_text}]
+        return []
+
+    if item_type == "summary":
         return []
 
     raise HTTPException(status_code=400, detail=f"Unsupported Responses input item type: {item_type}")
@@ -442,6 +456,56 @@ def responses_input_to_messages(payload: dict[str, Any]) -> list[dict[str, Any]]
         pass
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported Responses input type: {type(input_value).__name__}")
+
+    # Merge _reasoning_content markers from "reasoning" items into the
+    # nearest assistant message so DeepSeek thinking mode round-trips work.
+    # Reasoning items may appear before or after the assistant message.
+    pending_reasoning: list[str] = []
+    merged: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("_reasoning_content"):
+            rc = message.pop("_reasoning_content")
+            # Try to attach to a preceding assistant message
+            attached = False
+            for i in range(len(merged) - 1, -1, -1):
+                if merged[i].get("role") == "assistant":
+                    merged[i]["reasoning_content"] = (
+                        (merged[i].get("reasoning_content") or "") + "\n" + rc
+                    ).lstrip("\n")
+                    attached = True
+                    break
+            if not attached:
+                pending_reasoning.append(rc)
+            continue
+        if message.get("role") == "assistant" and pending_reasoning:
+            message["reasoning_content"] = "\n".join(pending_reasoning) + (
+                ("\n" + message["reasoning_content"]) if message.get("reasoning_content") else ""
+            )
+            pending_reasoning.clear()
+        merged.append(message)
+    messages = merged
+
+    # Merge consecutive assistant messages that only carry tool_calls
+    # (no text content) into a single assistant message.  This avoids
+    # interleaved assistant/tool ordering that causes
+    # normalize_chat_messages_for_upstream to drop complete blocks.
+    if len(messages) > 1:
+        compacted: list[dict[str, Any]] = []
+        for message in messages:
+            if (
+                message.get("role") == "assistant"
+                and not message.get("content")
+                and message.get("tool_calls")
+                and not message.get("reasoning_content")
+                and compacted
+                and compacted[-1].get("role") == "assistant"
+                and not compacted[-1].get("content")
+                and not compacted[-1].get("reasoning_content")
+            ):
+                compacted[-1].setdefault("tool_calls", []).extend(message.get("tool_calls") or [])
+            else:
+                compacted.append(message)
+        messages = compacted
 
     return messages
 
@@ -595,7 +659,35 @@ def normalize_chat_messages_for_upstream(messages: list[dict[str, Any]]) -> list
             dropped_incomplete_tool_blocks,
             dropped_orphan_tool_messages,
         )
-    return normalized
+
+    # Final pass: prune individual tool_calls from kept blocks whose
+    # tool messages were lost in a different dropped block.
+    pruned_tool_calls = 0
+    all_tool_message_ids: set[str] = set()
+    for message in normalized:
+        if message.get("role") == "tool" and message.get("tool_call_id"):
+            all_tool_message_ids.add(str(message["tool_call_id"]))
+    cleaned: list[dict[str, Any]] = []
+    for message in normalized:
+        if message.get("role") == "assistant" and message.get("tool_calls"):
+            original_calls = message["tool_calls"]
+            kept_calls = [
+                call for call in original_calls
+                if not isinstance(call, dict)
+                or (call.get("id") or call.get("call_id") or call.get("tool_call_id"))
+                    and str(call.get("id") or call.get("call_id") or call.get("tool_call_id")) in all_tool_message_ids
+            ]
+            pruned_tool_calls += len(original_calls) - len(kept_calls)
+            if kept_calls:
+                message = dict(message)
+                message["tool_calls"] = kept_calls
+                cleaned.append(message)
+            # else: drop the entire message (no tool_calls remain)
+        else:
+            cleaned.append(message)
+    if pruned_tool_calls:
+        LOG.info("normalized_chat_messages pruned_orphan_tool_calls=%s", pruned_tool_calls)
+    return cleaned
 
 
 def missing_tool_call_ids_from_error_detail(detail: str) -> set[str]:
@@ -782,6 +874,16 @@ def chat_message_to_response_output(
     tool_name_aliases = tool_name_aliases or {}
     output: list[dict[str, Any]] = []
     text = message.get("content") or ""
+    reasoning = text_from_content(message.get("reasoning_content"))
+    if reasoning:
+        output.append(
+            {
+                "id": new_id("rs"),
+                "type": "reasoning",
+                "status": "completed",
+                "summary": [{"type": "summary_text", "text": reasoning}],
+            }
+        )
     if text:
         output.append(
             {
@@ -839,7 +941,15 @@ def response_output_to_chat_messages(
 
     for item in output:
         item_type = item.get("type")
-        if item_type == "message":
+        if item_type == "reasoning":
+            for summary in item.get("summary") or []:
+                summary_text = summary.get("text", "")
+                if summary_text:
+                    if not reasoning_content:
+                        reasoning_content = summary_text
+                    else:
+                        reasoning_content += "\n" + summary_text
+        elif item_type == "message":
             text = text_from_content(item.get("content"))
             if text:
                 pending_text.append(text)
@@ -1138,6 +1248,7 @@ async def stream_response(
     text_item_id: str | None = None
     text_output = ""
     reasoning_content = ""
+    reasoning_item_id: str | None = None
     tool_items: dict[str, dict[str, Any]] = {}
     tool_call_order: list[str] = []
 
@@ -1206,6 +1317,18 @@ async def stream_response(
 
                         reasoning_content_delta = delta.get("reasoning_content") or ""
                         if reasoning_content_delta:
+                            if reasoning_item_id is None:
+                                reasoning_item_id = new_id("rs")
+                                reasoning_item = {
+                                    "id": reasoning_item_id,
+                                    "type": "reasoning",
+                                    "status": "in_progress",
+                                    "summary": [],
+                                }
+                                yield sse(
+                                    "response.output_item.added",
+                                    {"type": "response.output_item.added", "output_index": 0, "item": reasoning_item},
+                                )
                             reasoning_content += str(reasoning_content_delta)
 
                         content_delta = delta.get("content") or ""
@@ -1219,27 +1342,29 @@ async def stream_response(
                                     "role": "assistant",
                                     "content": [],
                                 }
+                                text_output_idx = 1 if reasoning_item_id is not None else 0
                                 yield sse(
                                     "response.output_item.added",
-                                    {"type": "response.output_item.added", "output_index": 0, "item": item},
+                                    {"type": "response.output_item.added", "output_index": text_output_idx, "item": item},
                                 )
                                 yield sse(
                                     "response.content_part.added",
                                     {
                                         "type": "response.content_part.added",
                                         "item_id": text_item_id,
-                                        "output_index": 0,
+                                        "output_index": text_output_idx,
                                         "content_index": 0,
                                         "part": {"type": "output_text", "text": "", "annotations": []},
                                     },
                                 )
                             text_output += content_delta
+                            text_output_idx = 1 if reasoning_item_id is not None else 0
                             yield sse(
                                 "response.output_text.delta",
                                 {
                                     "type": "response.output_text.delta",
                                     "item_id": text_item_id,
-                                    "output_index": 0,
+                                    "output_index": text_output_idx,
                                     "content_index": 0,
                                     "delta": content_delta,
                                 },
@@ -1265,7 +1390,7 @@ async def stream_response(
                                     existing["input"] = ""
                                 tool_items[index] = existing
                                 tool_call_order.append(index)
-                                output_index = (1 if text_item_id is not None else 0) + len(tool_call_order) - 1
+                                output_index = (1 if reasoning_item_id is not None else 0) + (1 if text_item_id is not None else 0) + len(tool_call_order) - 1
                                 yield sse(
                                     "response.output_item.added",
                                     {
@@ -1290,7 +1415,7 @@ async def stream_response(
                                         {
                                             "type": "response.function_call_arguments.delta",
                                             "item_id": existing["id"],
-                                            "output_index": (1 if text_item_id is not None else 0) + tool_call_order.index(index),
+                                            "output_index": (1 if reasoning_item_id is not None else 0) + (1 if text_item_id is not None else 0) + tool_call_order.index(index),
                                             "delta": arg_delta,
                                         },
                                     )
@@ -1309,6 +1434,20 @@ async def stream_response(
         LOG.info("request_done request_id=%s model=%s status=client_cancelled elapsed_ms=%d", request_id, model, int((time.perf_counter() - started) * 1000))
         raise
 
+    reasoning_offset = 1 if reasoning_item_id is not None else 0
+    if reasoning_item_id is not None:
+        reasoning_item = {
+            "id": reasoning_item_id,
+            "type": "reasoning",
+            "status": "completed",
+            "summary": [{"type": "summary_text", "text": reasoning_content}],
+        }
+        output.append(reasoning_item)
+        yield sse(
+            "response.output_item.done",
+            {"type": "response.output_item.done", "output_index": 0, "item": reasoning_item},
+        )
+
     if text_item_id is not None:
         text_item = {
             "id": text_item_id,
@@ -1323,7 +1462,7 @@ async def stream_response(
             {
                 "type": "response.output_text.done",
                 "item_id": text_item_id,
-                "output_index": 0,
+                "output_index": reasoning_offset,
                 "content_index": 0,
                 "text": text_output,
             },
@@ -1333,12 +1472,12 @@ async def stream_response(
             {
                 "type": "response.content_part.done",
                 "item_id": text_item_id,
-                "output_index": 0,
+                "output_index": reasoning_offset,
                 "content_index": 0,
                 "part": {"type": "output_text", "text": text_output, "annotations": []},
             },
         )
-        yield sse("response.output_item.done", {"type": "response.output_item.done", "output_index": 0, "item": text_item})
+        yield sse("response.output_item.done", {"type": "response.output_item.done", "output_index": reasoning_offset, "item": text_item})
 
     for index in tool_call_order:
         item = tool_items[index]

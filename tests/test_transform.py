@@ -17,6 +17,7 @@ from proxy_app.main import (  # noqa: E402
     record_completed_metrics,
     record_request_metrics,
     response_output_to_chat_messages,
+    responses_input_to_messages,
     store_response,
     tool_name_aliases_for_chat_tools,
 )
@@ -523,6 +524,136 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(after["upstream_usage_tokens"]["prompt"] - before["upstream_usage_tokens"]["prompt"], 3)
         self.assertEqual(after["upstream_usage_tokens"]["completion"] - before["upstream_usage_tokens"]["completion"], 4)
         self.assertEqual(after["upstream_usage_tokens"]["total"] - before["upstream_usage_tokens"]["total"], 7)
+
+    def test_chat_message_to_response_output_includes_reasoning_item(self) -> None:
+        output, text = chat_message_to_response_output(
+            {"role": "assistant", "content": "hello", "reasoning_content": "thinking..."},
+        )
+        self.assertEqual(text, "hello")
+        reasoning_items = [i for i in output if i["type"] == "reasoning"]
+        self.assertEqual(len(reasoning_items), 1)
+        self.assertEqual(reasoning_items[0]["summary"][0]["text"], "thinking...")
+        message_items = [i for i in output if i["type"] == "message"]
+        self.assertEqual(len(message_items), 1)
+
+    def test_chat_message_to_response_output_no_reasoning_when_empty(self) -> None:
+        output, text = chat_message_to_response_output(
+            {"role": "assistant", "content": "hello"},
+        )
+        reasoning_items = [i for i in output if i["type"] == "reasoning"]
+        self.assertEqual(len(reasoning_items), 0)
+
+    def test_response_output_to_chat_messages_extracts_reasoning_from_item(self) -> None:
+        messages = response_output_to_chat_messages(
+            [
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "my thoughts"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "answer"}],
+                },
+            ],
+        )
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertEqual(messages[0]["content"], "answer")
+        self.assertEqual(messages[0]["reasoning_content"], "my thoughts")
+
+    def test_input_item_to_messages_preserves_reasoning_content_in_assistant_message(self) -> None:
+        messages = input_item_to_messages(
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": "hello",
+                "reasoning_content": "thinking step by step",
+            }
+        )
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["role"], "assistant")
+        self.assertEqual(messages[0]["content"], "hello")
+        self.assertEqual(messages[0]["reasoning_content"], "thinking step by step")
+
+    def test_input_item_to_messages_reasoning_item_merges_to_previous_assistant(self) -> None:
+        payload = {
+            "model": "deepseek-v4-pro",
+            "input": [
+                {"type": "message", "role": "user", "content": "hi"},
+                {"type": "message", "role": "assistant", "content": "hello"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "I thought about it"}],
+                },
+            ],
+        }
+        messages = responses_input_to_messages(payload)
+        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+        self.assertEqual(len(assistant_msgs), 1)
+        self.assertEqual(assistant_msgs[0]["reasoning_content"], "I thought about it")
+
+    def test_consecutive_function_calls_are_merged_into_one_assistant_message(self) -> None:
+        """Multiple function_call input items should merge into one assistant message."""
+        payload = {
+            "model": "deepseek-v4-pro",
+            "input": [
+                {"type": "message", "role": "user", "content": "do stuff"},
+                {"type": "function_call", "call_id": "call_A", "name": "read_file", "arguments": "{}"},
+                {"type": "function_call", "call_id": "call_B", "name": "write_file", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_A", "output": "file content"},
+                {"type": "function_call_output", "call_id": "call_B", "output": "written"},
+                {"type": "message", "role": "user", "content": "what next?"},
+            ],
+        }
+        messages = responses_input_to_messages(payload)
+        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+        self.assertEqual(len(assistant_msgs), 1, "consecutive function_calls should merge into one assistant message")
+        self.assertEqual(len(assistant_msgs[0]["tool_calls"]), 2)
+        tool_msgs = [m for m in messages if m["role"] == "tool"]
+        self.assertEqual(len(tool_msgs), 2)
+
+    def test_function_call_with_text_not_merged(self) -> None:
+        """An assistant message with text content should NOT merge with the next."""
+        payload = {
+            "model": "deepseek-v4-pro",
+            "input": [
+                {"type": "message", "role": "user", "content": "go"},
+                {"type": "message", "role": "assistant", "content": "thinking..."},
+                {"type": "function_call", "call_id": "call_A", "name": "read", "arguments": "{}"},
+                {"type": "function_call_output", "call_id": "call_A", "output": "ok"},
+            ],
+        }
+        messages = responses_input_to_messages(payload)
+        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
+        # "thinking..." assistant + function_call assistant (separate because "thinking..." has content)
+        self.assertGreaterEqual(len(assistant_msgs), 2)
+
+    def test_reasoning_roundtrip_preserves_content(self) -> None:
+        """Full round-trip: DeepSeek response -> Responses output -> Codex echoes back -> Chat messages."""
+        # Step 1: DeepSeek returns a message with reasoning_content
+        output, _ = chat_message_to_response_output(
+            {"role": "assistant", "content": "result", "reasoning_content": "deep thoughts"},
+        )
+        # Step 2: response_output_to_chat_messages should reconstruct reasoning_content
+        messages = response_output_to_chat_messages(output)
+        self.assertEqual(len(messages), 1)
+        self.assertEqual(messages[0]["reasoning_content"], "deep thoughts")
+        self.assertEqual(messages[0]["content"], "result")
+
+        # Step 3: Codex sends back the output as input items
+        payload = {
+            "model": "deepseek-v4-pro",
+            "input": [
+                {"type": "message", "role": "user", "content": "question"},
+            ]
+            + output,
+        }
+        messages2 = responses_input_to_messages(payload)
+        assistant_msgs = [m for m in messages2 if m["role"] == "assistant"]
+        self.assertEqual(len(assistant_msgs), 1)
+        self.assertEqual(assistant_msgs[0]["reasoning_content"], "deep thoughts")
+        self.assertEqual(assistant_msgs[0]["content"], "result")
 
 
 if __name__ == "__main__":

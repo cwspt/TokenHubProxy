@@ -8,6 +8,9 @@ __pycache__/
 .env.*
 !.env.example
 *.log
+logs/
 dist/
 tools/TokenHubProxyLauncher/obj
 tools/TokenHubProxyLauncher/bin
+
+LocalCodeCheckResult/

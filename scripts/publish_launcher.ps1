@@ -4,7 +4,8 @@ param(
     [string]$OutputDir = "",
     [switch]$SelfContained,
     [switch]$NoSingleFile,
-    [switch]$SkipTests
+    [switch]$SkipTests,
+    [switch]$CleanRuntimeState
 )
 
 $ErrorActionPreference = "Stop"
@@ -70,15 +71,30 @@ function Copy-FileIfExists {
     }
 }
 
-function Remove-DirectoryForPublish {
+function Remove-PublishOutputFiles {
     param([Parameter(Mandatory = $true)][string]$Path)
 
     if (-not (Test-Path $Path)) {
         return
     }
 
+    $preservedNames = @()
+    if (-not $CleanRuntimeState) {
+        $preservedNames = @(".venv", "logs")
+    }
+
+    Write-Host "Cleaning publish output files..."
+    if ($preservedNames.Count -gt 0) {
+        Write-Host "Preserving runtime state directories: $($preservedNames -join ', ')"
+    }
+
     try {
-        Remove-Item -LiteralPath $Path -Recurse -Force
+        Get-ChildItem -LiteralPath $Path -Force | ForEach-Object {
+            if ($preservedNames -contains $_.Name) {
+                return
+            }
+            Remove-Item -LiteralPath $_.FullName -Recurse -Force
+        }
     }
     catch {
         throw "Could not clean publish output directory '$Path'. Close any running launcher/proxy from that directory, then retry. Original error: $($_.Exception.Message)"
@@ -107,8 +123,8 @@ if (-not $SkipTests) {
 Write-Host "Building WPF launcher..."
 Invoke-Checked -FilePath "dotnet" -Arguments @("build", $launcherProject, "-c", $Configuration)
 
-Remove-DirectoryForPublish -Path $OutputDir
 New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+Remove-PublishOutputFiles -Path $OutputDir
 
 $publishArgs = @(
     "publish",

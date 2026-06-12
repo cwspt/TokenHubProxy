@@ -20,6 +20,45 @@ logging.basicConfig(
     level=os.getenv("PROXY_LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s %(levelname)s %(message)s",
 )
+DIAG_LOG = logging.getLogger("tokenhub_proxy.diagnostics")
+DIAG_LOG.propagate = False
+DIAGNOSTIC_LOG_PATH = ""
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def configure_diagnostic_logging() -> None:
+    """Write metadata-only diagnostics to disk without exposing prompts or keys."""
+    global DIAGNOSTIC_LOG_PATH
+    enabled = env_bool("PROXY_DIAGNOSTIC_LOG_ENABLED", True)
+    DIAG_LOG.disabled = not enabled
+    if not enabled or DIAG_LOG.handlers:
+        return
+
+    log_dir = os.getenv("PROXY_DIAGNOSTIC_LOG_DIR", "logs").strip() or "logs"
+    log_level = os.getenv("PROXY_DIAGNOSTIC_LOG_LEVEL", "INFO").upper()
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        DIAGNOSTIC_LOG_PATH = os.path.abspath(
+            os.path.join(log_dir, f"proxy-diagnostics-{time.strftime('%Y%m%d')}.log")
+        )
+        handler = logging.FileHandler(DIAGNOSTIC_LOG_PATH, encoding="utf-8")
+        handler.setLevel(log_level)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        DIAG_LOG.addHandler(handler)
+        DIAG_LOG.setLevel(log_level)
+        LOG.info("diagnostic_log_enabled path=%s", DIAGNOSTIC_LOG_PATH)
+    except OSError as exc:
+        DIAG_LOG.disabled = True
+        LOG.warning("diagnostic_log_disabled reason=%s", exc)
+
+
+configure_diagnostic_logging()
 
 
 @dataclass(frozen=True)
@@ -33,6 +72,10 @@ class Settings:
     upstream_tool_choice_mode: str
     response_language_instruction: str
     response_ttl_seconds: int
+    max_context_chars: int
+    max_context_messages: int
+    max_context_tool_calls: int
+    max_context_repair_multiplier: float
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -53,6 +96,10 @@ class Settings:
             upstream_tool_choice_mode=tool_choice_mode,
             response_language_instruction=os.getenv("RESPONSE_LANGUAGE_INSTRUCTION", "").strip(),
             response_ttl_seconds=int(os.getenv("RESPONSE_STORE_TTL_SECONDS", "3600")),
+            max_context_chars=int(os.getenv("PROXY_MAX_CONTEXT_CHARS", "200000")),
+            max_context_messages=int(os.getenv("PROXY_MAX_CONTEXT_MESSAGES", "600")),
+            max_context_tool_calls=int(os.getenv("PROXY_MAX_CONTEXT_TOOL_CALLS", "250")),
+            max_context_repair_multiplier=float(os.getenv("PROXY_CONTEXT_REPAIR_HARD_LIMIT_MULTIPLIER", "4")),
         )
 
 
@@ -94,6 +141,15 @@ IGNORED_RESPONSES_TOOL_TYPES = {
     "namespace",
 }
 MAX_UPSTREAM_ERROR_DETAIL_CHARS = 500
+CONTEXT_LENGTH_ERROR_CODE = "context_length_exceeded"
+CONTEXT_LENGTH_ERROR_MARKERS = (
+    "maximum context length",
+    "max context length",
+    "context length",
+    "context_length_exceeded",
+    "reduce the length of the messages",
+    "too many tokens",
+)
 
 
 def now_unix() -> int:
@@ -253,6 +309,237 @@ def metrics_snapshot() -> dict[str, Any]:
             "Only character counts and upstream usage numbers are retained; dialogue text is not stored.",
             "Character counts are not tokenizer-exact token counts.",
         ],
+    }
+
+
+def diagnostic_log(event: str, **fields: Any) -> None:
+    if DIAG_LOG.disabled:
+        return
+    DIAG_LOG.info(
+        "%s %s",
+        event,
+        json.dumps(fields, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")),
+    )
+
+
+def diagnostic_summary_for_messages(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    role_counts: dict[str, int] = {}
+    content_chars = 0
+    max_content_chars = 0
+    tool_call_count = 0
+    tool_message_count = 0
+    reasoning_message_count = 0
+    messages_with_text = 0
+
+    for message in messages:
+        role = str(message.get("role") or "unknown")
+        role_counts[role] = role_counts.get(role, 0) + 1
+        if role == "tool":
+            tool_message_count += 1
+        if message.get("reasoning_content"):
+            reasoning_message_count += 1
+
+        text_chars = len(text_from_content(message.get("content")))
+        if text_chars:
+            messages_with_text += 1
+        content_chars += text_chars
+        max_content_chars = max(max_content_chars, text_chars)
+
+        raw_tool_calls = message.get("tool_calls")
+        if isinstance(raw_tool_calls, list):
+            tool_call_count += len(raw_tool_calls)
+
+    return {
+        "message_count": len(messages),
+        "role_counts": role_counts,
+        "messages_with_text": messages_with_text,
+        "content_chars": content_chars,
+        "max_content_chars": max_content_chars,
+        "tool_call_count": tool_call_count,
+        "tool_message_count": tool_message_count,
+        "reasoning_message_count": reasoning_message_count,
+    }
+
+
+def tool_names_for_diagnostics(tools: Any) -> list[str]:
+    if not isinstance(tools, list):
+        return []
+    names: list[str] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and function.get("name"):
+            names.append(str(function["name"]))
+        elif tool.get("name"):
+            names.append(str(tool["name"]))
+    return names
+
+
+def tool_choice_for_diagnostics(tool_choice: Any) -> Any:
+    if isinstance(tool_choice, str) or tool_choice is None:
+        return tool_choice
+    if isinstance(tool_choice, dict):
+        summarized: dict[str, Any] = {}
+        if "type" in tool_choice:
+            summarized["type"] = tool_choice.get("type")
+        function = tool_choice.get("function")
+        if isinstance(function, dict) and function.get("name"):
+            summarized["function_name"] = function.get("name")
+        elif tool_choice.get("name"):
+            summarized["name"] = tool_choice.get("name")
+        return summarized
+    return type(tool_choice).__name__
+
+
+def chat_payload_diagnostic_summary(chat_payload: dict[str, Any]) -> dict[str, Any]:
+    messages = chat_payload.get("messages")
+    if not isinstance(messages, list):
+        messages = []
+    tools = chat_payload.get("tools")
+    return {
+        "model": chat_payload.get("model"),
+        "stream": bool(chat_payload.get("stream")),
+        "message_summary": diagnostic_summary_for_messages(messages),
+        "tools_count": len(tools) if isinstance(tools, list) else 0,
+        "tool_names": tool_names_for_diagnostics(tools),
+        "tool_choice": tool_choice_for_diagnostics(chat_payload.get("tool_choice")),
+        "option_keys": sorted(
+            key for key in chat_payload.keys()
+            if key not in {"messages", "tools", "tool_choice", "model", "stream"}
+        ),
+    }
+
+
+def context_limit_violations(summary: dict[str, Any]) -> dict[str, int]:
+    message_summary = summary.get("message_summary")
+    if not isinstance(message_summary, dict):
+        return {}
+
+    checks = {
+        "content_chars": (
+            int(message_summary.get("content_chars") or 0),
+            SETTINGS.max_context_chars,
+        ),
+        "message_count": (
+            int(message_summary.get("message_count") or 0),
+            SETTINGS.max_context_messages,
+        ),
+        "tool_call_count": (
+            int(message_summary.get("tool_call_count") or 0),
+            SETTINGS.max_context_tool_calls,
+        ),
+    }
+
+    violations: dict[str, int] = {}
+    for name, (actual, limit) in checks.items():
+        if limit > 0 and actual > limit:
+            violations[name] = actual
+    return violations
+
+
+def context_repair_hard_limit_violations(summary: dict[str, Any]) -> dict[str, int]:
+    multiplier = SETTINGS.max_context_repair_multiplier
+    if multiplier <= 0:
+        return {}
+    message_summary = summary.get("message_summary")
+    if not isinstance(message_summary, dict):
+        return {}
+
+    hard_limits = {
+        "content_chars": SETTINGS.max_context_chars,
+        "message_count": SETTINGS.max_context_messages,
+        "tool_call_count": SETTINGS.max_context_tool_calls,
+    }
+    violations: dict[str, int] = {}
+    for name, limit in hard_limits.items():
+        if limit <= 0:
+            continue
+        actual = int(message_summary.get(name) or 0)
+        if actual > int(limit * multiplier):
+            violations[name] = actual
+    return violations
+
+
+def context_limit_error_detail(violations: dict[str, int]) -> str:
+    limits = {
+        "content_chars": SETTINGS.max_context_chars,
+        "message_count": SETTINGS.max_context_messages,
+        "tool_call_count": SETTINGS.max_context_tool_calls,
+    }
+    details = ", ".join(
+        f"{name}={actual} limit={limits[name]}"
+        for name, actual in violations.items()
+    )
+    return (
+        "Proxy context limit exceeded before sending the request upstream. "
+        "Start a new Codex session, run /compact, or reduce tool/history output. "
+        f"{details}"
+    )
+
+
+def can_repair_context_limit_with_tool_history(summary: dict[str, Any]) -> bool:
+    message_summary = summary.get("message_summary")
+    if not isinstance(message_summary, dict):
+        return False
+    return (
+        int(message_summary.get("tool_call_count") or 0) > 0
+        or int(message_summary.get("tool_message_count") or 0) > 0
+    )
+
+
+def responses_error_json(message: str, code: str, status_code: int) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error" if status_code < 500 else "upstream_error",
+                "code": code,
+                "param": "input",
+            }
+        },
+    )
+
+
+def is_context_length_error_detail(detail: str) -> bool:
+    lower_detail = detail.lower()
+    if "tool_call_ids did not have response messages" in lower_detail:
+        return False
+    return any(marker in lower_detail for marker in CONTEXT_LENGTH_ERROR_MARKERS)
+
+
+def is_tool_history_error_detail(detail: str) -> bool:
+    lower_detail = detail.lower()
+    return "tool_call_ids did not have response messages" in lower_detail
+
+
+def map_upstream_error_status(status_code: int, detail: str) -> int:
+    if status_code == 400:
+        if is_context_length_error_detail(detail) or is_tool_history_error_detail(detail):
+            return 400
+    return map_httpx_error(status_code)
+
+
+def response_output_diagnostic_summary(
+    output_text: str,
+    output: list[dict[str, Any]],
+    usage: Any,
+) -> dict[str, Any]:
+    item_type_counts: dict[str, int] = {}
+    for item in output:
+        item_type = str(item.get("type") or "unknown")
+        item_type_counts[item_type] = item_type_counts.get(item_type, 0) + 1
+    return {
+        "output_items": len(output),
+        "item_type_counts": item_type_counts,
+        "output_text_chars": len(output_text),
+        "output_tool_call_chars": output_tool_call_char_count(output),
+        "usage": {
+            "prompt_tokens": usage_int(usage, "prompt_tokens"),
+            "completion_tokens": usage_int(usage, "completion_tokens"),
+            "total_tokens": usage_int(usage, "total_tokens"),
+        },
     }
 
 
@@ -616,7 +903,73 @@ def message_has_tool_calls(message: dict[str, Any]) -> bool:
     return bool(message.get("tool_calls"))
 
 
+def compact_interleaved_tool_blocks(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    compacted: list[dict[str, Any]] = []
+    index = 0
+    compacted_blocks = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") != "assistant" or not message_has_tool_calls(message) or message.get("content"):
+            compacted.append(message)
+            index += 1
+            continue
+
+        assistant_messages: list[dict[str, Any]] = []
+        tool_messages: list[dict[str, Any]] = []
+        reasoning_parts: list[str] = []
+        cursor = index
+        while cursor < len(messages):
+            candidate = messages[cursor]
+            if (
+                candidate.get("role") != "assistant"
+                or not message_has_tool_calls(candidate)
+                or candidate.get("content")
+            ):
+                break
+
+            assistant_messages.append(candidate)
+            if candidate.get("reasoning_content"):
+                reasoning_parts.append(text_from_content(candidate.get("reasoning_content")))
+            cursor += 1
+
+            expected_ids = message_tool_call_ids(candidate)
+            while cursor < len(messages) and messages[cursor].get("role") == "tool":
+                tool_message = messages[cursor]
+                tool_call_id = tool_message.get("tool_call_id")
+                if tool_call_id and str(tool_call_id) in expected_ids:
+                    tool_messages.append(tool_message)
+                    cursor += 1
+                    continue
+                break
+
+        if len(assistant_messages) <= 1:
+            compacted.append(message)
+            index += 1
+            continue
+
+        merged_tool_calls: list[Any] = []
+        for assistant_message in assistant_messages:
+            merged_tool_calls.extend(assistant_message.get("tool_calls") or [])
+
+        merged_message: dict[str, Any] = {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": merged_tool_calls,
+        }
+        if reasoning_parts:
+            merged_message["reasoning_content"] = "\n".join(reasoning_parts)
+        compacted.append(merged_message)
+        compacted.extend(tool_messages)
+        compacted_blocks += len(assistant_messages) - 1
+        index = cursor
+
+    if compacted_blocks:
+        LOG.info("compacted_interleaved_tool_blocks merged_blocks=%s", compacted_blocks)
+    return compacted
+
+
 def normalize_chat_messages_for_upstream(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    messages = compact_interleaved_tool_blocks(messages)
     normalized: list[dict[str, Any]] = []
     dropped_orphan_tool_messages = 0
     dropped_incomplete_tool_blocks = 0
@@ -709,6 +1062,7 @@ def drop_tool_call_blocks_by_ids(
         return messages
     repaired: list[dict[str, Any]] = []
     dropped_blocks = 0
+    pruned_tool_calls = 0
     dropped_tool_messages = 0
     index = 0
     while index < len(messages):
@@ -719,24 +1073,50 @@ def drop_tool_call_blocks_by_ids(
             index += 1
             continue
 
-        dropped_blocks += 1
+        raw_tool_calls = [
+            call for call in message.get("tool_calls") or []
+            if isinstance(call, dict)
+        ]
+        kept_tool_calls = [
+            call for call in raw_tool_calls
+            if str(call.get("id") or call.get("call_id") or call.get("tool_call_id") or "")
+            not in missing_tool_call_ids
+        ]
+        kept_tool_call_ids = {
+            str(call.get("id") or call.get("call_id") or call.get("tool_call_id"))
+            for call in kept_tool_calls
+            if call.get("id") or call.get("call_id") or call.get("tool_call_id")
+        }
+        pruned_tool_calls += len(raw_tool_calls) - len(kept_tool_calls)
+
+        if kept_tool_calls:
+            repaired_message = dict(message)
+            repaired_message["tool_calls"] = kept_tool_calls
+            repaired.append(repaired_message)
+        else:
+            dropped_blocks += 1
+
         index += 1
         while index < len(messages) and messages[index].get("role") == "tool":
-            dropped_tool_messages += 1
+            tool_call_id = messages[index].get("tool_call_id")
+            if kept_tool_call_ids and tool_call_id and str(tool_call_id) in kept_tool_call_ids:
+                repaired.append(messages[index])
+            else:
+                dropped_tool_messages += 1
             index += 1
 
-    if dropped_blocks == 0:
-        fallback = drop_all_tool_call_blocks(messages)
+    if dropped_blocks == 0 and pruned_tool_calls == 0:
         LOG.info(
-            "repaired_missing_tool_call_blocks missing_tool_call_ids=%s dropped_blocks=0 fallback_drop_all_tool_blocks=true",
+            "repaired_missing_tool_call_blocks missing_tool_call_ids=%s no_matching_blocks=true",
             ",".join(sorted(missing_tool_call_ids)),
         )
-        return fallback
+        return messages
 
     LOG.info(
-        "repaired_missing_tool_call_blocks missing_tool_call_ids=%s dropped_blocks=%s dropped_tool_messages=%s",
+        "repaired_missing_tool_call_blocks missing_tool_call_ids=%s dropped_blocks=%s pruned_tool_calls=%s dropped_tool_messages=%s",
         ",".join(sorted(missing_tool_call_ids)),
         dropped_blocks,
+        pruned_tool_calls,
         dropped_tool_messages,
     )
     return repaired
@@ -771,6 +1151,73 @@ def drop_all_tool_call_blocks(messages: list[dict[str, Any]]) -> list[dict[str, 
         dropped_tool_messages,
     )
     return repaired
+
+
+def trim_oldest_tool_call_blocks_to_context_limits(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Drop oldest tool-call blocks until the request fits local context limits."""
+    removable_ranges: list[tuple[int, int]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if message.get("role") == "assistant" and message_has_tool_calls(message):
+            start = index
+            index += 1
+            while index < len(messages) and messages[index].get("role") == "tool":
+                index += 1
+            removable_ranges.append((start, index))
+            continue
+
+        if message.get("role") == "tool":
+            removable_ranges.append((index, index + 1))
+
+        index += 1
+
+    if not removable_ranges:
+        return messages
+
+    dropped_indexes: set[int] = set()
+    dropped_ranges = 0
+    dropped_tool_messages = 0
+    candidate = messages
+    for start, end in removable_ranges:
+        dropped_ranges += 1
+        dropped_tool_messages += sum(
+            1 for idx in range(start, end)
+            if messages[idx].get("role") == "tool"
+        )
+        dropped_indexes.update(range(start, end))
+        candidate = [
+            message for idx, message in enumerate(messages)
+            if idx not in dropped_indexes
+        ]
+        summary = diagnostic_summary_for_messages(candidate)
+        if not context_limit_violations({"message_summary": summary}):
+            LOG.info(
+                "trimmed_oldest_tool_call_blocks dropped_ranges=%s dropped_tool_messages=%s remaining_messages=%s",
+                dropped_ranges,
+                dropped_tool_messages,
+                len(candidate),
+            )
+            return candidate
+
+    LOG.info(
+        "trimmed_oldest_tool_call_blocks dropped_ranges=%s dropped_tool_messages=%s remaining_messages=%s still_over_limit=true",
+        dropped_ranges,
+        dropped_tool_messages,
+        len(candidate),
+    )
+    return candidate
+
+
+def repair_messages_for_context_limits(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summary = chat_payload_diagnostic_summary({"messages": messages})
+    if (
+        context_limit_violations(summary)
+        and not context_repair_hard_limit_violations(summary)
+        and can_repair_context_limit_with_tool_history(summary)
+    ):
+        return trim_oldest_tool_call_blocks_to_context_limits(messages)
+    return messages
 
 
 def normalize_tool_call_ids_for_upstream(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1007,6 +1454,15 @@ def build_response_json(
     }
 
 
+def build_failed_response_json(response_id: str, model: str, code: str, message: str) -> dict[str, Any]:
+    response = build_response_json(response_id, model, [], "", None, status="failed")
+    response["error"] = {
+        "code": code,
+        "message": message,
+    }
+    return response
+
+
 def store_response(
     response_id: str,
     request_messages: list[dict[str, Any]],
@@ -1101,6 +1557,15 @@ async def health() -> dict[str, Any]:
         "tool_calls_enabled": SETTINGS.enable_tool_calls,
         "upstream_tool_choice_mode": SETTINGS.upstream_tool_choice_mode,
         "response_language_instruction_configured": bool(SETTINGS.response_language_instruction),
+        "diagnostic_log": {
+            "enabled": not DIAG_LOG.disabled,
+            "path": DIAGNOSTIC_LOG_PATH,
+        },
+        "context_limits": {
+            "max_context_chars": SETTINGS.max_context_chars,
+            "max_context_messages": SETTINGS.max_context_messages,
+            "max_context_tool_calls": SETTINGS.max_context_tool_calls,
+        },
         "metrics": metrics_snapshot(),
     }
 
@@ -1139,6 +1604,56 @@ async def create_response(request: Request, authorization: str | None = Header(d
     record_request_metrics(request_messages)
     model = chat_payload["model"]
     LOG.info("request_start request_id=%s model=%s stream=%s", request_id, model, stream)
+    payload_summary = chat_payload_diagnostic_summary(chat_payload)
+    diagnostic_log("request_prepared", request_id=request_id, summary=payload_summary)
+
+    context_violations = context_limit_violations(payload_summary)
+    hard_context_violations = context_repair_hard_limit_violations(payload_summary)
+    if (
+        context_violations
+        and not hard_context_violations
+        and can_repair_context_limit_with_tool_history(payload_summary)
+    ):
+        repaired_messages = trim_oldest_tool_call_blocks_to_context_limits(chat_payload.get("messages") or [])
+        repaired_summary = diagnostic_summary_for_messages(repaired_messages)
+        diagnostic_log(
+            "context_limit_repair",
+            request_id=request_id,
+            before=payload_summary["message_summary"],
+            after=repaired_summary,
+            strategy="trim_oldest_tool_call_blocks",
+            violations=context_violations,
+        )
+        chat_payload = {
+            **chat_payload,
+            "messages": repaired_messages,
+        }
+        request_messages = repaired_messages
+        payload_summary = chat_payload_diagnostic_summary(chat_payload)
+        context_violations = context_limit_violations(payload_summary)
+
+    if hard_context_violations:
+        context_violations = hard_context_violations
+
+    if context_violations:
+        detail = context_limit_error_detail(context_violations)
+        record_failed_metrics()
+        diagnostic_log(
+            "context_limit_rejected",
+            request_id=request_id,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            hard_limit=bool(hard_context_violations),
+            violations=context_violations,
+            summary=payload_summary,
+        )
+        LOG.info(
+            "request_done request_id=%s model=%s status=context_limit_exceeded detail=%s elapsed_ms=%d",
+            request_id,
+            model,
+            detail,
+            int((time.perf_counter() - started) * 1000),
+        )
+        return responses_error_json(detail, CONTEXT_LENGTH_ERROR_CODE, 400)
 
     if stream:
         return StreamingResponse(
@@ -1167,10 +1682,22 @@ async def create_response(request: Request, authorization: str | None = Header(d
                 )
             except httpx.TimeoutException:
                 record_failed_metrics()
+                diagnostic_log(
+                    "request_timeout",
+                    request_id=request_id,
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                    summary=chat_payload_diagnostic_summary(chat_payload),
+                )
                 LOG.info("request_done request_id=%s model=%s status=timeout elapsed_ms=%d", request_id, model, int((time.perf_counter() - started) * 1000))
                 raise HTTPException(status_code=504, detail="TokenHub upstream request timed out") from None
             except httpx.HTTPError:
                 record_failed_metrics()
+                diagnostic_log(
+                    "request_http_error",
+                    request_id=request_id,
+                    elapsed_ms=int((time.perf_counter() - started) * 1000),
+                    summary=chat_payload_diagnostic_summary(chat_payload),
+                )
                 LOG.info("request_done request_id=%s model=%s status=http_error elapsed_ms=%d", request_id, model, int((time.perf_counter() - started) * 1000))
                 raise HTTPException(status_code=502, detail="TokenHub upstream connection failed") from None
 
@@ -1180,17 +1707,45 @@ async def create_response(request: Request, authorization: str | None = Header(d
             detail = sanitized_upstream_error_from_response(upstream)
             missing_tool_call_ids = missing_tool_call_ids_from_error_detail(detail)
             if attempt == 0 and missing_tool_call_ids:
+                before_summary = diagnostic_summary_for_messages(chat_payload.get("messages") or [])
+                repaired_messages = drop_tool_call_blocks_by_ids(
+                    chat_payload.get("messages") or [],
+                    missing_tool_call_ids,
+                )
+                repaired_messages = repair_messages_for_context_limits(repaired_messages)
                 chat_payload = {
                     **chat_payload,
-                    "messages": drop_tool_call_blocks_by_ids(
-                        chat_payload.get("messages") or [],
-                        missing_tool_call_ids,
-                    ),
+                    "messages": repaired_messages,
                 }
+                diagnostic_log(
+                    "tool_history_repair",
+                    request_id=request_id,
+                    attempt=attempt + 1,
+                    upstream_status=upstream.status_code,
+                    missing_tool_call_ids_count=len(missing_tool_call_ids),
+                    before=before_summary,
+                    after=diagnostic_summary_for_messages(repaired_messages),
+                )
                 continue
 
             record_failed_metrics()
-            status_code = map_httpx_error(upstream.status_code)
+            status_code = map_upstream_error_status(upstream.status_code, detail)
+            error_code = (
+                CONTEXT_LENGTH_ERROR_CODE
+                if is_context_length_error_detail(detail)
+                else str(upstream.status_code)
+            )
+            diagnostic_log(
+                "upstream_error",
+                request_id=request_id,
+                attempt=attempt + 1,
+                upstream_status=upstream.status_code,
+                mapped_status=status_code,
+                detail=detail,
+                retry_after=upstream.headers.get("retry-after"),
+                elapsed_ms=int((time.perf_counter() - started) * 1000),
+                summary=chat_payload_diagnostic_summary(chat_payload),
+            )
             LOG.info(
                 "request_done request_id=%s model=%s status=upstream_error upstream_status=%s detail=%s elapsed_ms=%d",
                 request_id,
@@ -1199,6 +1754,8 @@ async def create_response(request: Request, authorization: str | None = Header(d
                 detail,
                 int((time.perf_counter() - started) * 1000),
             )
+            if status_code == 400 and error_code == CONTEXT_LENGTH_ERROR_CODE:
+                return responses_error_json(detail, CONTEXT_LENGTH_ERROR_CODE, 400)
             raise HTTPException(status_code=status_code, detail=detail)
 
     data = upstream.json()
@@ -1220,6 +1777,13 @@ async def create_response(request: Request, authorization: str | None = Header(d
     )
     store_response(response_id, request_messages, output, reasoning_content)
     record_completed_metrics(output_text, output, data.get("usage"))
+    diagnostic_log(
+        "request_completed",
+        request_id=request_id,
+        response_id=response_id,
+        elapsed_ms=int((time.perf_counter() - started) * 1000),
+        response=response_output_diagnostic_summary(output_text, output, data.get("usage")),
+    )
     LOG.info(
         "request_done request_id=%s response_id=%s model=%s status=completed elapsed_ms=%d",
         request_id,
@@ -1272,22 +1836,59 @@ async def stream_response(
                         )
                         missing_tool_call_ids = missing_tool_call_ids_from_error_detail(detail)
                         if attempt == 0 and missing_tool_call_ids:
+                            before_summary = diagnostic_summary_for_messages(chat_payload.get("messages") or [])
+                            repaired_messages = drop_tool_call_blocks_by_ids(
+                                chat_payload.get("messages") or [],
+                                missing_tool_call_ids,
+                            )
+                            repaired_messages = repair_messages_for_context_limits(repaired_messages)
                             chat_payload = {
                                 **chat_payload,
-                                "messages": drop_tool_call_blocks_by_ids(
-                                    chat_payload.get("messages") or [],
-                                    missing_tool_call_ids,
-                                ),
+                                "messages": repaired_messages,
                             }
+                            diagnostic_log(
+                                "tool_history_repair",
+                                request_id=request_id,
+                                attempt=attempt + 1,
+                                upstream_status=upstream.status_code,
+                                missing_tool_call_ids_count=len(missing_tool_call_ids),
+                                before=before_summary,
+                                after=diagnostic_summary_for_messages(repaired_messages),
+                            )
                             continue
 
                         record_failed_metrics()
+                        mapped_status = map_upstream_error_status(upstream.status_code, detail)
+                        error_code = (
+                            CONTEXT_LENGTH_ERROR_CODE
+                            if is_context_length_error_detail(detail)
+                            else str(upstream.status_code)
+                        )
+                        diagnostic_log(
+                            "upstream_error",
+                            request_id=request_id,
+                            attempt=attempt + 1,
+                            upstream_status=upstream.status_code,
+                            mapped_status=mapped_status,
+                            detail=detail,
+                            retry_after=upstream.headers.get("retry-after"),
+                            elapsed_ms=int((time.perf_counter() - started) * 1000),
+                            summary=chat_payload_diagnostic_summary(chat_payload),
+                        )
                         yield sse(
                             "error",
                             {
                                 "type": "error",
-                                "code": str(upstream.status_code),
+                                "code": error_code,
                                 "message": detail,
+                            },
+                        )
+                        failed_response = build_failed_response_json(response_id, model, error_code, detail)
+                        yield sse(
+                            "response.failed",
+                            {
+                                "type": "response.failed",
+                                "response": failed_response,
                             },
                         )
                         LOG.info(
@@ -1422,15 +2023,51 @@ async def stream_response(
                     break
     except httpx.TimeoutException:
         record_failed_metrics()
-        yield sse("error", {"type": "error", "code": "timeout", "message": "TokenHub upstream request timed out"})
+        diagnostic_log(
+            "request_timeout",
+            request_id=request_id,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            summary=chat_payload_diagnostic_summary(chat_payload),
+        )
+        error_code = "timeout"
+        error_message = "TokenHub upstream request timed out"
+        yield sse("error", {"type": "error", "code": error_code, "message": error_message})
+        yield sse(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": build_failed_response_json(response_id, model, error_code, error_message),
+            },
+        )
         LOG.info("request_done request_id=%s model=%s status=timeout elapsed_ms=%d", request_id, model, int((time.perf_counter() - started) * 1000))
         return
     except httpx.HTTPError:
         record_failed_metrics()
-        yield sse("error", {"type": "error", "code": "upstream_connection_failed", "message": "TokenHub upstream connection failed"})
+        diagnostic_log(
+            "request_http_error",
+            request_id=request_id,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            summary=chat_payload_diagnostic_summary(chat_payload),
+        )
+        error_code = "upstream_connection_failed"
+        error_message = "TokenHub upstream connection failed"
+        yield sse("error", {"type": "error", "code": error_code, "message": error_message})
+        yield sse(
+            "response.failed",
+            {
+                "type": "response.failed",
+                "response": build_failed_response_json(response_id, model, error_code, error_message),
+            },
+        )
         LOG.info("request_done request_id=%s model=%s status=http_error elapsed_ms=%d", request_id, model, int((time.perf_counter() - started) * 1000))
         return
     except asyncio.CancelledError:
+        diagnostic_log(
+            "request_cancelled",
+            request_id=request_id,
+            elapsed_ms=int((time.perf_counter() - started) * 1000),
+            summary=chat_payload_diagnostic_summary(chat_payload),
+        )
         LOG.info("request_done request_id=%s model=%s status=client_cancelled elapsed_ms=%d", request_id, model, int((time.perf_counter() - started) * 1000))
         raise
 
@@ -1513,6 +2150,13 @@ async def stream_response(
     completed = build_response_json(response_id, model, output, text_output, None, status="completed")
     store_response(response_id, request_messages, output, reasoning_content)
     record_completed_metrics(text_output, output, None)
+    diagnostic_log(
+        "request_completed",
+        request_id=request_id,
+        response_id=response_id,
+        elapsed_ms=int((time.perf_counter() - started) * 1000),
+        response=response_output_diagnostic_summary(text_output, output, None),
+    )
     yield sse("response.completed", {"type": "response.completed", "response": completed})
     LOG.info(
         "request_done request_id=%s response_id=%s model=%s status=completed elapsed_ms=%d",

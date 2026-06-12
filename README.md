@@ -161,6 +161,10 @@ $env:CODEX_GLM_PROXY_KEY = "本机代理访问密钥"
 $env:PROXY_HOST = "127.0.0.1"
 $env:PROXY_PORT = "8787"
 $env:PROXY_REQUEST_TIMEOUT_SECONDS = "600"
+$env:PROXY_MAX_CONTEXT_CHARS = "200000"
+$env:PROXY_MAX_CONTEXT_MESSAGES = "600"
+$env:PROXY_MAX_CONTEXT_TOOL_CALLS = "250"
+$env:PROXY_CONTEXT_REPAIR_HARD_LIMIT_MULTIPLIER = "4"
 ```
 
 工具调用默认关闭，必须先探测：
@@ -226,6 +230,12 @@ $env:ENABLE_TOOL_CALLS = "false"
 
 这时代理仍可做文本验证，但 Codex 代码代理能力不可靠。
 
+上下文保护说明：
+
+- 当请求历史轻微超过 `PROXY_MAX_CONTEXT_*` 时，代理会优先裁掉最旧的工具调用/工具输出块，并尽量保留最近的工具结果，减少模型重复读取同一批文件的概率。
+- 当请求历史超过 `PROXY_MAX_CONTEXT_*` 的 `PROXY_CONTEXT_REPAIR_HARD_LIMIT_MULTIPLIER` 倍时，代理会直接返回 `context_length_exceeded`，让 Codex 触发压缩上下文或提示新开会话。
+- 如果确实要关闭这个硬刹车，可以把 `PROXY_CONTEXT_REPAIR_HARD_LIMIT_MULTIPLIER` 设为 `0`，但不建议长期这样做。
+
 ## 启动代理
 
 ```powershell
@@ -264,6 +274,7 @@ model = "glm-5.1"
 model_reasoning_effort = "medium"
 model_verbosity = "medium"
 model_context_window = 64000
+model_auto_compact_token_limit = 48000
 model_max_output_tokens = 8192
 
 [model_providers.glm_tokenhub_proxy]
@@ -357,6 +368,8 @@ FastAPI app 可导入
 - 模型响应正文
 - TokenHub Key
 - Codex 本地代理 Key
+
+如果需要排查复杂的上游错误，可以看 `logs\proxy-diagnostics-YYYYMMDD.log`。这个文件只写结构化元数据，比如消息数量、工具调用数量、状态码、耗时和修复结果，不写正文。
 
 ## 给下一轮维护者
 

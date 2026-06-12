@@ -20,6 +20,7 @@ model = "$Model"
 model_reasoning_effort = "medium"
 model_verbosity = "medium"
 model_context_window = 64000
+model_auto_compact_token_limit = 48000
 model_max_output_tokens = 8192
 
 [model_providers.glm_tokenhub_proxy]

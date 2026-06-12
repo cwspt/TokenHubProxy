@@ -86,6 +86,10 @@ public partial class MainWindow : Window
         HostLabel.Content = T("label.host");
         PortLabel.Content = T("label.port");
         TimeoutLabel.Content = T("label.timeout");
+        CodexContextLabel.Content = T("label.codexContext");
+        ContextWindowLabel.Text = T("label.contextWindow");
+        AutoCompactLabel.Text = T("label.autoCompact");
+        MaxOutputTokensLabel.Text = T("label.maxOutputTokens");
         ResponseLanguageLabel.Content = T("label.responseLanguage");
         EnableToolCallsCheckBox.Content = T("checkbox.enableToolCalls");
         ToolCallsHintTextBlock.Text = T("hint.toolCalls");
@@ -124,47 +128,74 @@ public partial class MainWindow : Window
             "TokenHub / GLM-5.1",
             "https://tokenhub.tencentmaas.com/plan/v3/chat/completions",
             "glm-5.1",
-            600));
+            600,
+            64000,
+            48000,
+            8192));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-chat",
             "https://api.deepseek.com/chat/completions",
             "deepseek-chat",
-            600));
+            600,
+            64000,
+            48000,
+            8192));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-reasoner",
             "https://api.deepseek.com/chat/completions",
             "deepseek-reasoner",
-            900));
+            900,
+            64000,
+            48000,
+            8192));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-v3",
             "https://api.deepseek.com/chat/completions",
             "deepseek-v3",
-            600));
+            600,
+            64000,
+            48000,
+            8192));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-v4-flash",
             "https://api.deepseek.com/chat/completions",
             "deepseek-v4-flash",
-            600));
+            600,
+            64000,
+            48000,
+            8192));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-v4-pro",
             "https://api.deepseek.com/chat/completions",
             "deepseek-v4-pro",
-            900));
+            900,
+            64000,
+            48000,
+            8192));
         _upstreamPresets.Add(new UpstreamPreset(
             "Vinno DeepSeek Relay / deepseek-v4-pro",
             "https://t.vinno.com/v1/chat/completions",
             "deepseek-v4-pro",
-            900));
+            900,
+            64000,
+            48000,
+            8192));
         _upstreamPresets.Add(new UpstreamPreset(
             "Vinno DeepSeek Relay / glm-5-1",
             "https://t.vinno.com/v1/chat/completions",
             "glm-5-1",
-            900));
+            900,
+            64000,
+            48000,
+            8192));
         _upstreamPresets.Add(new UpstreamPreset(
             "Vinno DeepSeek Relay / minimax-m-2-7",
             "https://t.vinno.com/v1/chat/completions",
             "minimax-m-2-7",
-            900));
+            900,
+            32000,
+            24000,
+            4096));
 
         UpstreamPresetComboBox.Items.Clear();
         foreach (var preset in _upstreamPresets)
@@ -223,10 +254,21 @@ public partial class MainWindow : Window
         TokenHubBaseUrlTextBox.Text = preset.BaseUrl;
         TokenHubModelTextBox.Text = preset.Model;
         TimeoutTextBox.Text = preset.TimeoutSeconds.ToString();
+        ContextWindowTextBox.Text = preset.ContextWindowTokens.ToString();
+        AutoCompactTextBox.Text = preset.AutoCompactTokenLimit.ToString();
+        MaxOutputTokensTextBox.Text = preset.MaxOutputTokens.ToString();
         _omitForcedToolChoice = false;
         if (logChange)
         {
-            Log(string.Format(T("log.presetApplied"), preset.DisplayName, preset.BaseUrl, preset.Model, preset.TimeoutSeconds));
+            Log(string.Format(
+                T("log.presetApplied"),
+                preset.DisplayName,
+                preset.BaseUrl,
+                preset.Model,
+                preset.TimeoutSeconds,
+                preset.ContextWindowTokens,
+                preset.AutoCompactTokenLimit,
+                preset.MaxOutputTokens));
         }
     }
 
@@ -325,7 +367,7 @@ public partial class MainWindow : Window
 
             Log(T("log.probing"));
             await Task.Yield();
-            var result = await RunCommandCaptureAsync(pythonPath, "scripts\\probe_tokenhub.py", root, BuildProxyEnvironment());
+            var result = await RunCommandCaptureAsync(pythonPath, "scripts\\probe_tokenhub.py", root, BuildProxyEnvironment(root));
             var toolCallsOk = result.Output.Contains("non_stream_tool_calls: PASS", StringComparison.Ordinal)
                 && result.Output.Contains("stream_tool_calls: PASS", StringComparison.Ordinal);
             var noForcedToolChoiceOk = result.Output.Contains("tool_variant_no_forced_choice: PASS", StringComparison.Ordinal);
@@ -376,7 +418,7 @@ public partial class MainWindow : Window
             _recoveryMonitorCts = cts;
             RecoveryMonitorButton.Content = T("button.stopMonitor");
             Log(string.Format(T("log.monitorStarted"), (int)RecoveryMonitorInterval.TotalSeconds));
-            _ = MonitorRecoveryAsync(root, pythonPath, BuildProxyEnvironment(), cts.Token);
+            _ = MonitorRecoveryAsync(root, pythonPath, BuildProxyEnvironment(root), cts.Token);
         }
         catch (Exception ex)
         {
@@ -445,8 +487,19 @@ public partial class MainWindow : Window
         TokenHubBaseUrlTextBox.Text = preset.BaseUrl;
         TokenHubModelTextBox.Text = preset.Model;
         TimeoutTextBox.Text = preset.TimeoutSeconds.ToString();
+        ContextWindowTextBox.Text = preset.ContextWindowTokens.ToString();
+        AutoCompactTextBox.Text = preset.AutoCompactTokenLimit.ToString();
+        MaxOutputTokensTextBox.Text = preset.MaxOutputTokens.ToString();
         _omitForcedToolChoice = false;
-        Log(string.Format(T("log.presetApplied"), preset.DisplayName, preset.BaseUrl, preset.Model, preset.TimeoutSeconds));
+        Log(string.Format(
+            T("log.presetApplied"),
+            preset.DisplayName,
+            preset.BaseUrl,
+            preset.Model,
+            preset.TimeoutSeconds,
+            preset.ContextWindowTokens,
+            preset.AutoCompactTokenLimit,
+            preset.MaxOutputTokens));
     }
 
     private async void StartProxyButton_Click(object sender, RoutedEventArgs e)
@@ -469,7 +522,7 @@ public partial class MainWindow : Window
                 throw new InvalidOperationException(T("err.missingVenv"));
             }
 
-            var env = BuildProxyEnvironment();
+            var env = BuildProxyEnvironment(root);
             env["ENABLE_TOOL_CALLS"] = EnableToolCallsCheckBox.IsChecked == true ? "true" : "false";
             env["UPSTREAM_TOOL_CHOICE_MODE"] = _omitForcedToolChoice ? "omit_forced" : "passthrough";
 
@@ -494,6 +547,7 @@ public partial class MainWindow : Window
             });
             SetStatus(true);
             Log(string.Format(T("log.proxyStarted"), ProxyHostTextBox.Text.Trim(), ProxyPortTextBox.Text.Trim()));
+            Log(string.Format(T("log.diagnosticLogPath"), Path.Combine(root, "logs")));
 
             await Task.Delay(500);
         });
@@ -674,7 +728,7 @@ public partial class MainWindow : Window
         };
     }
 
-    private Dictionary<string, string> BuildProxyEnvironment()
+    private Dictionary<string, string> BuildProxyEnvironment(string projectRoot)
     {
         var env = BuildBaseEnvironment();
         var selectedPreset = GetSelectedUpstreamPreset();
@@ -692,6 +746,8 @@ public partial class MainWindow : Window
         env["PROXY_REQUEST_TIMEOUT_SECONDS"] = TimeoutTextBox.Text.Trim();
         env["ENABLE_TOOL_CALLS"] = EnableToolCallsCheckBox.IsChecked == true ? "true" : "false";
         env["UPSTREAM_TOOL_CHOICE_MODE"] = _omitForcedToolChoice ? "omit_forced" : "passthrough";
+        env["PROXY_DIAGNOSTIC_LOG_ENABLED"] = "true";
+        env["PROXY_DIAGNOSTIC_LOG_DIR"] = Path.Combine(projectRoot, "logs");
         var languageInstruction = ResponseLanguageInstruction();
         if (!string.IsNullOrWhiteSpace(languageInstruction))
         {
@@ -994,14 +1050,23 @@ public partial class MainWindow : Window
             var requests = metrics.GetProperty("requests");
             var chars = metrics.GetProperty("chars");
             var usage = metrics.GetProperty("upstream_usage_tokens");
-            return string.Join(
-                Environment.NewLine,
+            var lines = new List<string>
+            {
                 string.Format(T("log.healthSummary"), GetString(root, "status"), GetString(root, "model"), GetBool(root, "tool_calls_enabled")),
                 string.Format(T("log.languageInstruction"), GetBool(root, "response_language_instruction_configured")),
                 string.Format(T("log.metricsRequests"), GetInt(requests, "started"), GetInt(requests, "completed"), GetInt(requests, "failed")),
-                string.Format(T("log.metricsChars"), GetInt(chars, "request_text"), GetInt(chars, "response_text"), GetInt(chars, "response_tool_calls"), GetInt(chars, "total_counted")),
+                string.Format(T("log.metricsChars"), GetInt(chars, "request_text"), GetInt(chars, "response_text"), GetInt(chars, "response_tool_calls"), GetIntWithFallback(chars, "total_counted", "total")),
                 string.Format(T("log.metricsTokens"), GetInt(usage, "prompt"), GetInt(usage, "completion"), GetInt(usage, "total")),
-                T("log.metricsNote"));
+            };
+
+            if (root.TryGetProperty("diagnostic_log", out var diagnosticLog) &&
+                diagnosticLog.ValueKind == JsonValueKind.Object)
+            {
+                lines.Add(string.Format(T("log.diagnosticLogSummary"), GetBool(diagnosticLog, "enabled"), GetString(diagnosticLog, "path")));
+            }
+
+            lines.Add(T("log.metricsNote"));
+            return string.Join(Environment.NewLine, lines);
         }
         catch (JsonException)
         {
@@ -1032,6 +1097,12 @@ public partial class MainWindow : Window
             : 0;
     }
 
+    private static int GetIntWithFallback(JsonElement element, string primaryName, string fallbackName)
+    {
+        var primary = GetInt(element, primaryName);
+        return primary != 0 || !element.TryGetProperty(fallbackName, out _) ? primary : GetInt(element, fallbackName);
+    }
+
     private CodexHomeInfo InitializeCodexHome(string codexHome, string defaultConfig)
     {
         if (string.IsNullOrWhiteSpace(codexHome))
@@ -1056,14 +1127,21 @@ public partial class MainWindow : Window
         var model = string.IsNullOrWhiteSpace(TokenHubModelTextBox.Text) ? selectedPreset.Model : TokenHubModelTextBox.Text.Trim();
         var host = string.IsNullOrWhiteSpace(ProxyHostTextBox.Text) ? "127.0.0.1" : ProxyHostTextBox.Text.Trim();
         var port = string.IsNullOrWhiteSpace(ProxyPortTextBox.Text) ? "8787" : ProxyPortTextBox.Text.Trim();
+        var contextWindow = ParsePositiveIntOrDefault(ContextWindowTextBox.Text, selectedPreset.ContextWindowTokens);
+        var autoCompact = ParsePositiveIntOrDefault(AutoCompactTextBox.Text, selectedPreset.AutoCompactTokenLimit);
+        var maxOutputTokens = ParsePositiveIntOrDefault(MaxOutputTokensTextBox.Text, selectedPreset.MaxOutputTokens);
+        ContextWindowTextBox.Text = contextWindow.ToString();
+        AutoCompactTextBox.Text = autoCompact.ToString();
+        MaxOutputTokensTextBox.Text = maxOutputTokens.ToString();
         var presetLabel = string.IsNullOrWhiteSpace(selectedPreset.DisplayName) ? model : selectedPreset.DisplayName;
         return $$"""
 model_provider = "glm_tokenhub_proxy"
 model = "{{model}}"
 model_reasoning_effort = "medium"
 model_verbosity = "medium"
-model_context_window = 64000
-model_max_output_tokens = 8192
+model_context_window = {{contextWindow}}
+model_auto_compact_token_limit = {{autoCompact}}
+model_max_output_tokens = {{maxOutputTokens}}
 
 [model_providers.glm_tokenhub_proxy]
 name = "{{presetLabel}} via local proxy"
@@ -1169,6 +1247,13 @@ request_max_retries = 2
         return normalized;
     }
 
+    private static int ParsePositiveIntOrDefault(string value, int defaultValue)
+    {
+        return int.TryParse(value.Trim(), out var parsed) && parsed > 0
+            ? parsed
+            : defaultValue;
+    }
+
     private UpstreamPreset GetSelectedUpstreamPreset()
     {
         if (UpstreamPresetComboBox.SelectedIndex >= 0 &&
@@ -1179,7 +1264,14 @@ request_max_retries = 2
 
         return _upstreamPresets.Count > 0
             ? _upstreamPresets[0]
-            : new UpstreamPreset("Custom", TokenHubBaseUrlTextBox.Text.Trim(), TokenHubModelTextBox.Text.Trim(), 600);
+            : new UpstreamPreset(
+                "Custom",
+                TokenHubBaseUrlTextBox.Text.Trim(),
+                TokenHubModelTextBox.Text.Trim(),
+                600,
+                64000,
+                48000,
+                8192);
     }
 
     private void SetButtonsEnabled(bool enabled)
@@ -1322,6 +1414,10 @@ request_max_retries = 2
         ["label.host"] = "主机",
         ["label.port"] = "端口",
         ["label.timeout"] = "超时秒数",
+        ["label.codexContext"] = "Codex 上下文设置",
+        ["label.contextWindow"] = "上下文窗口",
+        ["label.autoCompact"] = "自动压缩",
+        ["label.maxOutputTokens"] = "最大输出",
         ["label.responseLanguage"] = "回复语言",
         ["checkbox.enableToolCalls"] = "启用工具调用",
         ["hint.toolCalls"] = "先探测上游。非流式和流式工具调用都通过后，启动器会自动启用工具调用。",
@@ -1374,6 +1470,7 @@ request_max_retries = 2
         ["log.proxyExited"] = "代理进程已退出。",
         ["log.proxyExitedCode"] = "代理进程已退出，退出码 {0}。",
         ["log.proxyStarted"] = "代理已启动：http://{0}:{1}/v1",
+        ["log.diagnosticLogPath"] = "后台安全诊断日志目录：{0}",
         ["log.openedConfig"] = "已打开配置：{0}",
         ["log.desktopNotFound"] = "未能自动找到 Codex Desktop。可使用脚本并传入 -CodexDesktopPath。",
         ["log.vscodeNotFound"] = "未能自动找到 VS Code。请确认 code 在 PATH 中，或使用 PowerShell 脚本传入 -CodePath。",
@@ -1393,8 +1490,9 @@ request_max_retries = 2
         ["log.metricsRequests"] = "请求数：已开始 {0}，已完成 {1}，失败 {2}",
         ["log.metricsChars"] = "字符数：请求文本 {0}，响应文本 {1}，响应工具调用 {2}，合计 {3}",
         ["log.metricsTokens"] = "上游 usage token：prompt {0}，completion {1}，total {2}",
+        ["log.diagnosticLogSummary"] = "后台安全诊断日志：启用 {0}，路径 {1}",
         ["log.metricsNote"] = "说明：字符数和 usage 只保存在当前代理进程内存中；不会保存对话正文；字符数不等同于精确 token 数。",
-        ["log.presetApplied"] = "已切换上游预设：{0} -> {1}，模型 {2}，超时 {3} 秒",
+        ["log.presetApplied"] = "已切换上游预设：{0} -> {1}，模型 {2}，超时 {3} 秒，窗口 {4}，压缩 {5}，输出 {6}",
         ["log.baseUrlAppliedTokenHub"] = "已填入 TokenHub Base URL。",
         ["log.baseUrlAppliedDeepSeek"] = "已填入 DeepSeek Base URL。",
         ["tooltip.upstreamPreset"] = "当前上游预设：{0}",
@@ -1431,6 +1529,10 @@ request_max_retries = 2
         ["label.host"] = "Host",
         ["label.port"] = "Port",
         ["label.timeout"] = "Timeout seconds",
+        ["label.codexContext"] = "Codex context settings",
+        ["label.contextWindow"] = "Context window",
+        ["label.autoCompact"] = "Auto compact",
+        ["label.maxOutputTokens"] = "Max output",
         ["label.responseLanguage"] = "Response language",
         ["checkbox.enableToolCalls"] = "Enable tool calls",
         ["hint.toolCalls"] = "Probe the upstream first. The launcher enables tool calls automatically when both tool-call checks pass.",
@@ -1483,6 +1585,7 @@ request_max_retries = 2
         ["log.proxyExited"] = "Proxy process exited.",
         ["log.proxyExitedCode"] = "Proxy process exited with code {0}.",
         ["log.proxyStarted"] = "Proxy started at http://{0}:{1}/v1",
+        ["log.diagnosticLogPath"] = "Safe backend diagnostic log directory: {0}",
         ["log.openedConfig"] = "Opened config: {0}",
         ["log.desktopNotFound"] = "Could not auto-detect Codex Desktop. Use scripts\\launch_codex_desktop_with_home.ps1 with -CodexDesktopPath.",
         ["log.vscodeNotFound"] = "Could not auto-detect VS Code. Ensure 'code' is in PATH or use the PowerShell launcher with -CodePath.",
@@ -1502,8 +1605,9 @@ request_max_retries = 2
         ["log.metricsRequests"] = "Requests: started {0}, completed {1}, failed {2}",
         ["log.metricsChars"] = "Chars: request text {0}, response text {1}, response tool calls {2}, total {3}",
         ["log.metricsTokens"] = "Upstream usage tokens: prompt {0}, completion {1}, total {2}",
+        ["log.diagnosticLogSummary"] = "Safe backend diagnostic log: enabled {0}, path {1}",
         ["log.metricsNote"] = "Note: char counts and usage stay in this proxy process memory only; dialogue text is not stored; chars are not tokenizer-exact token counts.",
-        ["log.presetApplied"] = "Upstream preset switched: {0} -> {1}, model {2}, timeout {3}s",
+        ["log.presetApplied"] = "Upstream preset switched: {0} -> {1}, model {2}, timeout {3}s, window {4}, compact {5}, output {6}",
         ["log.baseUrlAppliedTokenHub"] = "TokenHub Base URL applied.",
         ["log.baseUrlAppliedDeepSeek"] = "DeepSeek Base URL applied.",
         ["tooltip.upstreamPreset"] = "Current upstream preset: {0}",
@@ -1525,7 +1629,14 @@ request_max_retries = 2
         public bool UseEnglish { get; set; }
         public override string ToString() => UseEnglish ? EnName : ZhName;
     }
-    private sealed record UpstreamPreset(string DisplayName, string BaseUrl, string Model, int TimeoutSeconds)
+    private sealed record UpstreamPreset(
+        string DisplayName,
+        string BaseUrl,
+        string Model,
+        int TimeoutSeconds,
+        int ContextWindowTokens,
+        int AutoCompactTokenLimit,
+        int MaxOutputTokens)
     {
         public override string ToString() => DisplayName;
     }

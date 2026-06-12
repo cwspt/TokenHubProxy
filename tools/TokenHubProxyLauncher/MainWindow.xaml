@@ -147,6 +147,29 @@
                             <Label x:Name="TimeoutLabel" Content="Timeout seconds" />
                             <TextBox x:Name="TimeoutTextBox" Text="600" />
 
+                            <Label x:Name="CodexContextLabel" Content="Codex context settings" />
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="8" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="8" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <StackPanel Grid.Column="0">
+                                    <TextBlock x:Name="ContextWindowLabel" Text="Context window" FontWeight="SemiBold" Margin="0,0,0,4" />
+                                    <TextBox x:Name="ContextWindowTextBox" Text="64000" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="2">
+                                    <TextBlock x:Name="AutoCompactLabel" Text="Auto compact" FontWeight="SemiBold" Margin="0,0,0,4" />
+                                    <TextBox x:Name="AutoCompactTextBox" Text="48000" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="4">
+                                    <TextBlock x:Name="MaxOutputTokensLabel" Text="Max output" FontWeight="SemiBold" Margin="0,0,0,4" />
+                                    <TextBox x:Name="MaxOutputTokensTextBox" Text="8192" />
+                                </StackPanel>
+                            </Grid>
+
                             <Label x:Name="ResponseLanguageLabel" Content="Response language" />
                             <ComboBox x:Name="ResponseLanguageComboBox" Height="30" />
 

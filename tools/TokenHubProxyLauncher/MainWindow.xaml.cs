@@ -113,6 +113,8 @@ public partial class MainWindow : Window
         LaunchDesktopButton.ToolTip = T("tooltip.launchDesktop");
         LaunchVsCodeButton.Content = T("button.launchVsCode");
         LaunchVsCodeButton.ToolTip = T("tooltip.launchVsCode");
+        WriteConfigButton.Content = T("button.writeConfig");
+        WriteConfigButton.ToolTip = T("tooltip.writeConfig");
         CopyLogButton.Content = T("button.copyLog");
         ClearLogButton.Content = T("button.clearLog");
         HelpButton.Content = T("button.help");
@@ -161,17 +163,17 @@ public partial class MainWindow : Window
             "https://api.deepseek.com/chat/completions",
             "deepseek-v4-flash",
             600,
-            64000,
-            48000,
-            8192));
+             1000000,
+             800000,
+             384000));
         _upstreamPresets.Add(new UpstreamPreset(
             "DeepSeek / deepseek-v4-pro",
             "https://api.deepseek.com/chat/completions",
             "deepseek-v4-pro",
             900,
-            64000,
-            48000,
-            8192));
+             1000000,
+             800000,
+             384000));
         _upstreamPresets.Add(new UpstreamPreset(
             "Vinno DeepSeek Relay / deepseek-v4-pro",
             "https://t.vinno.com/v1/chat/completions",
@@ -291,6 +293,7 @@ public partial class MainWindow : Window
             "launch Codex Desktop" => T("op.launchDesktop"),
             "launch VS Code" => T("op.launchVsCode"),
             "health check" => T("op.health"),
+            "write config" => T("op.writeConfig"),
             _ => operationName
         };
     }
@@ -634,6 +637,35 @@ public partial class MainWindow : Window
             await Task.Run(() => StartProcessWithEnvironment(exe, $"\"{root}\"", root, env));
             Log(string.Format(T("log.launchedVsCode"), homeInfo.Home));
             Log($"Config: {homeInfo.Config}");
+        });
+    }
+
+    private async void WriteConfigButton_Click(object sender, RoutedEventArgs e)
+    {
+        await RunBusyAsync("write config", async () =>
+        {
+            var config = BuildDefaultCodexConfig();
+            var codexHomes = new[]
+            {
+                DesktopCodexHomeTextBox.Text.Trim(),
+                VsCodeCodexHomeTextBox.Text.Trim(),
+            };
+
+            foreach (var codexHome in codexHomes)
+            {
+                if (string.IsNullOrWhiteSpace(codexHome))
+                {
+                    continue;
+                }
+                var home = Environment.ExpandEnvironmentVariables(codexHome);
+                var targetConfig = Path.Combine(home, "config.toml");
+                await Task.Run(() =>
+                {
+                    Directory.CreateDirectory(home);
+                    File.WriteAllText(targetConfig, config, Encoding.UTF8);
+                });
+                Log(string.Format(T("log.configWritten"), targetConfig));
+            }
         });
     }
 
@@ -1284,6 +1316,7 @@ request_max_retries = 2
         HealthCheckButton.IsEnabled = enabled;
         LaunchDesktopButton.IsEnabled = enabled;
         LaunchVsCodeButton.IsEnabled = enabled;
+        WriteConfigButton.IsEnabled = enabled;
         CopyLogButton.IsEnabled = true;
         ClearLogButton.IsEnabled = true;
         HelpButton.IsEnabled = true;
@@ -1504,7 +1537,11 @@ request_max_retries = 2
         ["err.projectRootInvalid"] = "项目根目录看起来不是 TokenHubResponsesProxy。",
         ["err.tokenhubKeyRequired"] = "必须填写 TOKENHUB_API_KEY。",
         ["err.proxyKeyRequired"] = "必须填写 CODEX_GLM_PROXY_KEY。需要时可点击生成。",
-        ["err.codexHomeRequired"] = "必须填写 CODEX_HOME 路径。"
+        ["err.codexHomeRequired"] = "必须填写 CODEX_HOME 路径。",
+        ["button.writeConfig"] = "写入配置",
+        ["tooltip.writeConfig"] = "将当前上下文设置强制写入两个隔离的 CODEX_HOME config.toml 文件",
+        ["log.configWritten"] = "已写入配置：{0}",
+        ["op.writeConfig"] = "写入配置",
     };
 
     private static readonly Dictionary<string, string> En = new()
@@ -1619,7 +1656,11 @@ request_max_retries = 2
         ["err.projectRootInvalid"] = "Project root does not look like TokenHubResponsesProxy.",
         ["err.tokenhubKeyRequired"] = "TOKENHUB_API_KEY is required.",
         ["err.proxyKeyRequired"] = "CODEX_GLM_PROXY_KEY is required. Generate one if needed.",
-        ["err.codexHomeRequired"] = "CODEX_HOME path is required."
+        ["button.writeConfig"] = "Write config",
+        ["tooltip.writeConfig"] = "Force-write current context settings to both isolated CODEX_HOME config.toml files",
+        ["log.configWritten"] = "Config written: {0}",
+        ["op.writeConfig"] = "write config",
+        ["err.codexHomeRequired"] = "CODEX_HOME path is required.",
     };
 
     private sealed record CommandResult(int ExitCode, string Output);

@@ -17,6 +17,7 @@ from proxy_app.main import (  # noqa: E402
     drop_tool_call_blocks_by_ids,
     is_context_length_error_detail,
     map_upstream_error_status,
+    input_item_type_diagnostic_summary,
     input_item_to_messages,
     missing_tool_call_ids_from_error_detail,
     normalize_chat_messages_for_upstream,
@@ -27,6 +28,7 @@ from proxy_app.main import (  # noqa: E402
     response_output_to_chat_messages,
     responses_input_to_messages,
     store_response,
+    trim_oldest_conversation_turns_to_context_limits,
     trim_oldest_tool_call_blocks_to_context_limits,
     tool_name_aliases_for_chat_tools,
 )
@@ -372,6 +374,82 @@ class TransformTests(unittest.TestCase):
         self.assertEqual(payload["tools"][0]["type"], "function")
         self.assertEqual(payload["tools"][0]["function"]["name"], "shell")
         self.assertEqual(payload["tools"][0]["function"]["parameters"]["required"], ["input"])
+
+    def test_additional_tools_input_is_merged_with_top_level_tools(self) -> None:
+        payload, messages, custom_tool_names = build_chat_payload(
+            {
+                "model": "deepseek-v4-pro",
+                "input": [
+                    {"type": "message", "role": "user", "content": "hello"},
+                    {
+                        "type": "additional_tools",
+                        "tools": [
+                            {
+                                "type": "function",
+                                "name": "read_file",
+                                "description": "Duplicate declaration.",
+                                "parameters": {"type": "object", "properties": {}},
+                            },
+                            {
+                                "type": "custom",
+                                "name": "shell",
+                                "description": "Run a command.",
+                            },
+                        ],
+                    },
+                    {
+                        "type": "additional_tools",
+                        "additional_tools": [
+                            {
+                                "type": "function",
+                                "name": "list_files",
+                                "parameters": {"type": "object", "properties": {}},
+                            }
+                        ],
+                    },
+                ],
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "read_file",
+                        "description": "Primary declaration.",
+                        "parameters": {"type": "object", "properties": {}},
+                    }
+                ],
+            },
+            stream=False,
+        )
+
+        self.assertEqual(messages, [{"role": "user", "content": "hello"}])
+        self.assertEqual(
+            [tool["function"]["name"] for tool in payload["tools"]],
+            ["read_file", "shell", "list_files"],
+        )
+        self.assertEqual(custom_tool_names, {"shell"})
+
+    def test_additional_tools_diagnostic_omits_tool_content(self) -> None:
+        summary = input_item_type_diagnostic_summary(
+            [
+                {"type": "message", "role": "user", "content": "secret prompt"},
+                {
+                    "type": "additional_tools",
+                    "tools": [
+                        {
+                            "type": "function",
+                            "name": "shell_command",
+                            "description": "secret tool description",
+                            "parameters": {"type": "object", "properties": {}},
+                        }
+                    ],
+                },
+            ]
+        )
+        encoded = str(summary)
+
+        self.assertEqual(summary["type_counts"], {"message": 1, "additional_tools": 1})
+        self.assertEqual(summary["additional_tools"]["tool_definition_count"], 1)
+        self.assertNotIn("secret prompt", encoded)
+        self.assertNotIn("secret tool description", encoded)
 
     def test_chat_tool_call_to_response_custom_tool_call(self) -> None:
         output, text = chat_message_to_response_output(
@@ -748,6 +826,63 @@ class TransformTests(unittest.TestCase):
         self.assertNotIn("call_old", str(repaired))
         self.assertIn("call_recent", str(repaired))
         self.assertIn("recent result", str(repaired))
+
+    def test_context_limit_repair_trims_oldest_complete_conversation_turn(self) -> None:
+        original_chars = SETTINGS.max_context_chars
+        original_messages = SETTINGS.max_context_messages
+        original_tool_calls = SETTINGS.max_context_tool_calls
+        messages = [
+            {"role": "system", "content": "primary system"},
+            {"role": "user", "content": "old question"},
+            {"role": "assistant", "content": "old answer part one"},
+            {"role": "assistant", "content": "old answer part two"},
+            {"role": "system", "content": "secondary system"},
+            {"role": "user", "content": "current question"},
+            {"role": "assistant", "content": "current progress"},
+        ]
+        try:
+            object.__setattr__(SETTINGS, "max_context_chars", 1000)
+            object.__setattr__(SETTINGS, "max_context_messages", 6)
+            object.__setattr__(SETTINGS, "max_context_tool_calls", 20)
+
+            repaired = trim_oldest_conversation_turns_to_context_limits(messages)
+            repaired_summary = chat_payload_diagnostic_summary(
+                {"model": "deepseek-v4-pro", "stream": True, "messages": repaired}
+            )
+        finally:
+            object.__setattr__(SETTINGS, "max_context_chars", original_chars)
+            object.__setattr__(SETTINGS, "max_context_messages", original_messages)
+            object.__setattr__(SETTINGS, "max_context_tool_calls", original_tool_calls)
+
+        self.assertEqual(context_limit_violations(repaired_summary), {})
+        self.assertNotIn("old question", str(repaired))
+        self.assertNotIn("old answer part one", str(repaired))
+        self.assertNotIn("old answer part two", str(repaired))
+        self.assertIn("primary system", str(repaired))
+        self.assertIn("secondary system", str(repaired))
+        self.assertIn("current question", str(repaired))
+        self.assertIn("current progress", str(repaired))
+
+    def test_context_limit_repair_does_not_trim_latest_user_turn(self) -> None:
+        original_chars = SETTINGS.max_context_chars
+        original_messages = SETTINGS.max_context_messages
+        original_tool_calls = SETTINGS.max_context_tool_calls
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "x" * 50},
+        ]
+        try:
+            object.__setattr__(SETTINGS, "max_context_chars", 20)
+            object.__setattr__(SETTINGS, "max_context_messages", 20)
+            object.__setattr__(SETTINGS, "max_context_tool_calls", 20)
+
+            repaired = trim_oldest_conversation_turns_to_context_limits(messages)
+        finally:
+            object.__setattr__(SETTINGS, "max_context_chars", original_chars)
+            object.__setattr__(SETTINGS, "max_context_messages", original_messages)
+            object.__setattr__(SETTINGS, "max_context_tool_calls", original_tool_calls)
+
+        self.assertIs(repaired, messages)
 
     def test_context_repair_hard_limit_detects_runaway_history(self) -> None:
         original_chars = SETTINGS.max_context_chars

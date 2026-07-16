@@ -704,7 +704,98 @@ def input_item_to_messages(item: dict[str, Any]) -> list[dict[str, Any]]:
     if item_type == "summary":
         return []
 
+    # Newer Codex clients can carry per-request tool declarations inside the
+    # input array. They are handled by build_chat_payload, not as chat history.
+    if item_type == "additional_tools":
+        return []
+
     raise HTTPException(status_code=400, detail=f"Unsupported Responses input item type: {item_type}")
+
+
+def additional_response_tools_from_input(input_value: Any) -> list[dict[str, Any]]:
+    if not isinstance(input_value, list):
+        return []
+
+    tools: list[dict[str, Any]] = []
+    for item in input_value:
+        if not isinstance(item, dict) or item.get("type") != "additional_tools":
+            continue
+        for field in ("tools", "additional_tools"):
+            definitions = item.get(field)
+            if isinstance(definitions, list):
+                tools.extend(definition for definition in definitions if isinstance(definition, dict))
+    return tools
+
+
+def response_tool_identity(tool: dict[str, Any]) -> tuple[str, str] | None:
+    tool_type = str(tool.get("type") or "")
+    name = tool.get("name")
+    if tool_type == "function" and not name and isinstance(tool.get("function"), dict):
+        name = tool["function"].get("name")
+    if not tool_type:
+        return None
+    return tool_type, str(name or "")
+
+
+def merge_response_tool_definitions(primary_tools: Any, additional_tools: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
+    if primary_tools is None:
+        combined: list[Any] = []
+    elif isinstance(primary_tools, list):
+        combined = list(primary_tools)
+    else:
+        raise HTTPException(status_code=400, detail="Responses tools must be a list")
+
+    combined.extend(additional_tools)
+    if not combined:
+        return None
+
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for tool in combined:
+        if not isinstance(tool, dict):
+            raise HTTPException(status_code=400, detail="Responses tools entries must be objects")
+        identity = response_tool_identity(tool)
+        if identity is not None and identity in seen:
+            continue
+        if identity is not None:
+            seen.add(identity)
+        merged.append(tool)
+    return merged
+
+
+def input_item_type_diagnostic_summary(input_value: Any) -> dict[str, Any]:
+    if not isinstance(input_value, list):
+        return {"kind": type(input_value).__name__}
+
+    type_counts: dict[str, int] = {}
+    additional_item_count = 0
+    additional_tool_count = 0
+    additional_field_names: set[str] = set()
+    for item in input_value:
+        if not isinstance(item, dict):
+            type_counts[type(item).__name__] = type_counts.get(type(item).__name__, 0) + 1
+            continue
+        item_type = str(item.get("type") or "object")
+        type_counts[item_type] = type_counts.get(item_type, 0) + 1
+        if item_type != "additional_tools":
+            continue
+        additional_item_count += 1
+        additional_field_names.update(str(key) for key in item.keys())
+        for field in ("tools", "additional_tools"):
+            definitions = item.get(field)
+            if isinstance(definitions, list):
+                additional_tool_count += sum(1 for definition in definitions if isinstance(definition, dict))
+
+    return {
+        "kind": "list",
+        "item_count": len(input_value),
+        "type_counts": type_counts,
+        "additional_tools": {
+            "item_count": additional_item_count,
+            "tool_definition_count": additional_tool_count,
+            "field_names": sorted(additional_field_names),
+        },
+    }
 
 
 def responses_input_to_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1209,15 +1300,80 @@ def trim_oldest_tool_call_blocks_to_context_limits(messages: list[dict[str, Any]
     return candidate
 
 
+def trim_oldest_conversation_turns_to_context_limits(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Drop oldest complete non-system turns while preserving the latest user turn."""
+    if not context_limit_violations(
+        {"message_summary": diagnostic_summary_for_messages(messages)}
+    ):
+        return messages
+
+    user_indexes = [
+        index for index, message in enumerate(messages)
+        if message.get("role") == "user"
+    ]
+    if user_indexes:
+        protected_start = user_indexes[-1]
+    else:
+        non_system_indexes = [
+            index for index, message in enumerate(messages)
+            if message.get("role") != "system"
+        ]
+        protected_start = non_system_indexes[-1] if non_system_indexes else 0
+
+    removable_turns: list[list[int]] = []
+    current_turn: list[int] = []
+    for index, message in enumerate(messages[:protected_start]):
+        if message.get("role") == "system":
+            continue
+        if message.get("role") == "user" and current_turn:
+            removable_turns.append(current_turn)
+            current_turn = []
+        current_turn.append(index)
+    if current_turn:
+        removable_turns.append(current_turn)
+
+    if not removable_turns:
+        return messages
+
+    dropped_indexes: set[int] = set()
+    candidate = messages
+    for dropped_turns, turn_indexes in enumerate(removable_turns, start=1):
+        dropped_indexes.update(turn_indexes)
+        candidate = [
+            message for index, message in enumerate(messages)
+            if index not in dropped_indexes
+        ]
+        summary = diagnostic_summary_for_messages(candidate)
+        if not context_limit_violations({"message_summary": summary}):
+            LOG.info(
+                "trimmed_oldest_conversation_turns dropped_turns=%s dropped_messages=%s remaining_messages=%s",
+                dropped_turns,
+                len(dropped_indexes),
+                len(candidate),
+            )
+            return candidate
+
+    LOG.info(
+        "trimmed_oldest_conversation_turns dropped_turns=%s dropped_messages=%s remaining_messages=%s still_over_limit=true",
+        len(removable_turns),
+        len(dropped_indexes),
+        len(candidate),
+    )
+    return candidate
+
+
 def repair_messages_for_context_limits(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     summary = chat_payload_diagnostic_summary({"messages": messages})
-    if (
-        context_limit_violations(summary)
-        and not context_repair_hard_limit_violations(summary)
-        and can_repair_context_limit_with_tool_history(summary)
-    ):
-        return trim_oldest_tool_call_blocks_to_context_limits(messages)
-    return messages
+    if not context_limit_violations(summary) or context_repair_hard_limit_violations(summary):
+        return messages
+
+    repaired = messages
+    if can_repair_context_limit_with_tool_history(summary):
+        repaired = trim_oldest_tool_call_blocks_to_context_limits(repaired)
+
+    return trim_oldest_conversation_turns_to_context_limits(repaired)
 
 
 def normalize_tool_call_ids_for_upstream(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1285,7 +1441,9 @@ def build_chat_payload(payload: dict[str, Any], stream: bool) -> tuple[dict[str,
         "stream": stream,
     }
 
-    tools, custom_tool_names = responses_tools_to_chat_tools(payload.get("tools"))
+    additional_tools = additional_response_tools_from_input(payload.get("input"))
+    response_tools = merge_response_tool_definitions(payload.get("tools"), additional_tools)
+    tools, custom_tool_names = responses_tools_to_chat_tools(response_tools)
     if tools:
         if not SETTINGS.enable_tool_calls:
             raise HTTPException(status_code=400, detail="TokenHub/GLM tool_calls unsupported by probe")
@@ -1600,11 +1758,23 @@ async def create_response(request: Request, authorization: str | None = Header(d
     started = time.perf_counter()
     payload = await request.json()
     stream = bool(payload.get("stream", False))
-    chat_payload, request_messages, custom_tool_names = build_chat_payload(payload, stream=stream)
+    input_item_summary = input_item_type_diagnostic_summary(payload.get("input"))
+    try:
+        chat_payload, request_messages, custom_tool_names = build_chat_payload(payload, stream=stream)
+    except HTTPException as exc:
+        diagnostic_log(
+            "request_validation_error",
+            request_id=request_id,
+            stream=stream,
+            status_code=exc.status_code,
+            input_items=input_item_summary,
+        )
+        raise
     record_request_metrics(request_messages)
     model = chat_payload["model"]
     LOG.info("request_start request_id=%s model=%s stream=%s", request_id, model, stream)
     payload_summary = chat_payload_diagnostic_summary(chat_payload)
+    payload_summary["input_items"] = input_item_summary
     diagnostic_log("request_prepared", request_id=request_id, summary=payload_summary)
 
     context_violations = context_limit_violations(payload_summary)
@@ -1622,6 +1792,27 @@ async def create_response(request: Request, authorization: str | None = Header(d
             before=payload_summary["message_summary"],
             after=repaired_summary,
             strategy="trim_oldest_tool_call_blocks",
+            violations=context_violations,
+        )
+        chat_payload = {
+            **chat_payload,
+            "messages": repaired_messages,
+        }
+        request_messages = repaired_messages
+        payload_summary = chat_payload_diagnostic_summary(chat_payload)
+        context_violations = context_limit_violations(payload_summary)
+
+    if context_violations and not hard_context_violations:
+        repaired_messages = trim_oldest_conversation_turns_to_context_limits(
+            chat_payload.get("messages") or []
+        )
+        repaired_summary = diagnostic_summary_for_messages(repaired_messages)
+        diagnostic_log(
+            "context_limit_repair",
+            request_id=request_id,
+            before=payload_summary["message_summary"],
+            after=repaired_summary,
+            strategy="trim_oldest_conversation_turns",
             violations=context_violations,
         )
         chat_payload = {
